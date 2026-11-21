@@ -56,6 +56,8 @@ struct Tab {
     anchor: usize,
     scroll: i32,
     error: Option<String>,
+    /// A search below `path` replaces the folder's own items.
+    search: Option<String>,
 }
 
 impl Tab {
@@ -71,6 +73,7 @@ impl Tab {
             anchor: 0,
             scroll: 0,
             error: None,
+            search: None,
         }
     }
     fn entry(&self, i: usize) -> Option<&Entry> {
@@ -187,6 +190,12 @@ pub struct App {
     /// Remembered view per folder: view, zoom, sort, reverse.
     folders: std::collections::HashMap<PathBuf, (View, usize, SortKey, bool)>,
     gallery: Option<Gallery>,
+    search_edit: Option<String>,
+    search_due: Option<Instant>,
+    search_gen: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    searching: bool,
+    search_tx: std::sync::mpsc::Sender<(usize, Vec<Entry>, bool)>,
+    search_rx: std::sync::mpsc::Receiver<(usize, Vec<Entry>, bool)>,
     gallery_tx: std::sync::mpsc::Sender<(PathBuf, Option<crate::canvas::Image>)>,
     gallery_rx: std::sync::mpsc::Receiver<(PathBuf, Option<crate::canvas::Image>)>,
 }
@@ -327,6 +336,7 @@ impl App {
         let (thumbs, thumb_types) = crate::thumbs::Thumbs::start(wake);
         let (preview_tx, preview_rx) = std::sync::mpsc::channel();
         let (gallery_tx, gallery_rx) = std::sync::mpsc::channel();
+        let (search_tx, search_rx) = std::sync::mpsc::channel();
         // A drive plugged in or pulled out shows up in /dev/disk/by-id;
         // a mount or unmount makes /proc/self/mounts readable with POLLPRI.
         let dev_watch = if inotify >= 0 {
@@ -425,6 +435,12 @@ impl App {
             dropped_files: None,
             folders: load_folders(),
             gallery: None,
+            search_edit: None,
+            search_due: None,
+            search_gen: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            searching: false,
+            search_tx,
+            search_rx,
             gallery_tx,
             gallery_rx,
         };
@@ -443,6 +459,20 @@ impl App {
     // ---------------------------------------------------------------- data
 
     fn load_tab(&mut self, i: usize, reset: bool) {
+        if reset {
+            self.tabs[i].search = None;
+        } else if self.tabs[i].search.is_some() {
+            // Search results stay; only the hidden filter is applied again.
+            let hidden = self.hidden;
+            let t = &mut self.tabs[i];
+            t.shown = (0..t.all.len())
+                .filter(|k| hidden || !t.all[*k].hidden())
+                .collect();
+            t.selected = vec![false; t.shown.len()];
+            t.cursor = t.cursor.min(t.shown.len().saturating_sub(1));
+            self.dirty = true;
+            return;
+        }
         let keep = (!reset)
             .then(|| {
                 self.tabs[i]
@@ -869,6 +899,11 @@ impl App {
                     self.load_tab(a, false);
                 }
             }
+            if self.search_due.is_some_and(|t| Instant::now() >= t) {
+                self.search_due = None;
+                let q = self.search_edit.clone().unwrap_or_default();
+                self.start_search(q);
+            }
             if let Some(g) = &self.gallery {
                 if g.slideshow.is_some_and(|t| t.elapsed() >= SLIDE) {
                     self.gallery_step(1, true);
@@ -901,6 +936,10 @@ impl App {
             let mut timeout: i32 = -1;
             if let Some(at) = self.reload_at {
                 timeout = at.saturating_duration_since(Instant::now()).as_millis() as i32 + 1;
+            }
+            if let Some(t) = self.search_due {
+                let left = t.saturating_duration_since(Instant::now()).as_millis() as i32 + 1;
+                timeout = if timeout < 0 { left } else { timeout.min(left) };
             }
             if let Some(t) = self.gallery.as_ref().and_then(|g| g.slideshow) {
                 let left = SLIDE.saturating_sub(t.elapsed()).as_millis() as i32 + 1;
@@ -1288,6 +1327,9 @@ impl App {
         if self.connect.is_some() {
             return self.connect_key(sym, ctrl, shift);
         }
+        if self.search_edit.is_some() {
+            return self.search_key(sym, ctrl);
+        }
         if self.confirm.is_some() {
             match sym {
                 0xff0d | 0xff8d | 0x79 | 0x6a => {
@@ -1448,7 +1490,13 @@ impl App {
             0x7a => self.undo_last(),              // z
             0x6b => self.act(Act::Connect),        // k
             0x67 => self.open_gallery(None),       // g
-            0x64 => self.act(Act::Bookmark),       // d
+            0x66 => {
+                // f: search below this folder
+                let q = self.tab().search.clone().unwrap_or_default();
+                self.search_edit = Some(q);
+                self.dirty = true;
+            }
+            0x64 => self.act(Act::Bookmark), // d
             0x68 => {
                 // h
                 self.hidden = !self.hidden;
@@ -1805,6 +1853,37 @@ impl App {
             x += bw;
         }
         x += pad;
+        let search_shown = self
+            .search_edit
+            .clone()
+            .or_else(|| self.tab().search.clone());
+        if let Some(q) = search_shown {
+            let r = Rect::new(x, pad / 2, bar.x + bar.w - x - pad, bar_h - pad);
+            self.cv.fill(r, p.surface);
+            self.cv.frame(
+                r,
+                if self.search_edit.is_some() {
+                    p.accent
+                } else {
+                    p.border
+                },
+            );
+            let label = format!("Search {}: ", places::pretty(&self.tab().path));
+            let lw = self
+                .text
+                .draw(&mut self.cv, r.x + pad, ty, &label, font, p.muted);
+            let caret = if self.search_edit.is_some() {
+                "▏"
+            } else {
+                ""
+            };
+            let shown = self
+                .text
+                .ellipsize(&format!("{q}{caret}"), font, r.w - lw - 2 * pad);
+            self.text
+                .draw(&mut self.cv, r.x + pad + lw, ty, &shown, font, p.foreground);
+            return;
+        }
         if let Some(buf) = self.path_edit.clone() {
             let r = Rect::new(x, pad / 2, bar.x + bar.w - x - pad, bar_h - pad);
             self.cv.fill(r, p.surface);
@@ -2272,7 +2351,18 @@ impl App {
             .filter(|e| !e.is_dir)
             .map(|e| e.size)
             .sum();
-        let mut left = format!("{n} item{}", if n == 1 { "" } else { "s" });
+        let mut left = if t.search.is_some() {
+            format!(
+                "{n} found{}",
+                if self.searching {
+                    " · searching…"
+                } else {
+                    ""
+                }
+            )
+        } else {
+            format!("{n} item{}", if n == 1 { "" } else { "s" })
+        };
         if nsel > 0 {
             left.push_str(&format!(" · {nsel} selected"));
             if sel_bytes > 0 {
@@ -2393,6 +2483,24 @@ impl App {
                 .image
                 .map(|img| std::rc::Rc::new(crate::icons::scale_to_fit(&img, b, b)));
             self.thumb_img.insert(d.path, fitted);
+            self.dirty = true;
+        }
+        while let Ok((gen, found, done)) = self.search_rx.try_recv() {
+            if gen != self.search_gen.load(std::sync::atomic::Ordering::Relaxed) {
+                continue;
+            }
+            let hidden = self.hidden;
+            let t = self.tab_mut();
+            for e in found {
+                if hidden || !e.hidden() {
+                    t.shown.push(t.all.len());
+                    t.selected.push(false);
+                }
+                t.all.push(e);
+            }
+            if done {
+                self.searching = false;
+            }
             self.dirty = true;
         }
         while let Ok((path, img)) = self.gallery_rx.try_recv() {
@@ -4649,6 +4757,138 @@ impl App {
                 p.accent,
             );
         }
+    }
+}
+
+impl App {
+    fn search_key(&mut self, sym: u32, ctrl: bool) {
+        let Some(q) = self.search_edit.as_mut() else {
+            return;
+        };
+        match sym {
+            0xff1b => {
+                // Esc: back to the folder.
+                self.search_edit = None;
+                self.search_due = None;
+                self.search_gen
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                self.searching = false;
+                let a = self.active;
+                self.load_tab(a, true);
+                return;
+            }
+            0xff0d | 0xff8d | 0xff54 => {
+                // Enter or Down: keep the results, move into them.
+                self.search_edit = None;
+                if self.search_due.take().is_some() {
+                    let q = self.tab().search.clone().unwrap_or_default();
+                    let _ = q;
+                }
+            }
+            0xff08 => {
+                if ctrl {
+                    q.clear();
+                } else {
+                    q.pop();
+                }
+                self.search_due = Some(Instant::now() + Duration::from_millis(180));
+            }
+            _ => {
+                if let Some(c) = keysym_char(sym) {
+                    if !c.is_control() {
+                        q.push(c);
+                        self.search_due = Some(Instant::now() + Duration::from_millis(180));
+                    }
+                }
+            }
+        }
+        self.dirty = true;
+    }
+
+    /// Search names below the folder on a thread; results stream in.
+    fn start_search(&mut self, q: String) {
+        let gen = self
+            .search_gen
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            + 1;
+        let words: Vec<String> = q
+            .to_lowercase()
+            .split_whitespace()
+            .map(str::to_string)
+            .collect();
+        let t = self.tab_mut();
+        t.all.clear();
+        t.shown.clear();
+        t.selected.clear();
+        t.cursor = 0;
+        t.anchor = 0;
+        t.scroll = 0;
+        t.error = None;
+        if words.is_empty() {
+            t.search = None;
+            self.searching = false;
+            let a = self.active;
+            self.load_tab(a, true);
+            return;
+        }
+        t.search = Some(q);
+        let root = t.path.clone();
+        self.searching = true;
+        let tx = self.search_tx.clone();
+        let wake = self.wake;
+        let current = self.search_gen.clone();
+        let hidden = self.hidden;
+        let mime = std::sync::Arc::new(Mime::load());
+        std::thread::spawn(move || {
+            let alive = || current.load(std::sync::atomic::Ordering::Relaxed) == gen;
+            let mut stack = vec![root.clone()];
+            let mut batch = Vec::new();
+            let mut last = Instant::now();
+            let mut found = 0usize;
+            while let Some(dir) = stack.pop() {
+                if !alive() {
+                    return;
+                }
+                let Ok(rd) = std::fs::read_dir(&dir) else {
+                    continue;
+                };
+                for e in rd.flatten() {
+                    let name = e.file_name().to_string_lossy().into_owned();
+                    if !hidden && name.starts_with('.') {
+                        continue;
+                    }
+                    let Ok(ft) = e.file_type() else { continue };
+                    let p = e.path();
+                    if ft.is_dir() && !ft.is_symlink() {
+                        stack.push(p.clone());
+                    }
+                    let lower = name.to_lowercase();
+                    if words.iter().all(|w| lower.contains(w)) {
+                        if let Ok(mut v) = crate::dir::read_one(&p, &mime) {
+                            v.label = p
+                                .strip_prefix(&root)
+                                .map(|r| r.display().to_string())
+                                .unwrap_or(name);
+                            batch.push(v);
+                            found += 1;
+                        }
+                    }
+                }
+                if !batch.is_empty()
+                    && (batch.len() >= 200 || last.elapsed() > Duration::from_millis(120))
+                {
+                    let _ = tx.send((gen, std::mem::take(&mut batch), false));
+                    crate::ops::poke(wake);
+                    last = Instant::now();
+                }
+                if found >= 20_000 {
+                    break;
+                }
+            }
+            let _ = tx.send((gen, batch, true));
+            crate::ops::poke(wake);
+        });
+        self.dirty = true;
     }
 }
 

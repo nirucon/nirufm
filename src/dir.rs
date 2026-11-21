@@ -31,49 +31,55 @@ pub fn read(path: &Path, mime: &crate::mime::Mime) -> std::io::Result<Vec<Entry>
     let mut out = Vec::new();
     for item in std::fs::read_dir(path)? {
         let Ok(item) = item else { continue };
-        let name = item.file_name().to_string_lossy().into_owned();
-        let p = item.path();
-        let lmeta = match item.metadata() {
-            Ok(m) => m,
-            Err(_) => continue,
-        };
-        let is_link = lmeta.file_type().is_symlink();
-        // A link shows what it points at; a broken link stays a link.
-        let meta = if is_link {
-            std::fs::metadata(&p).unwrap_or(lmeta)
-        } else {
-            lmeta
-        };
-        let is_dir = meta.is_dir();
-        let mime_type = if is_dir {
-            "inode/directory".to_string()
-        } else {
-            mime.for_name(&name).to_string()
-        };
-        let label: String = name
-            .chars()
-            .map(|c| {
-                if c.is_control() || c == '\u{fffd}' {
-                    '?'
-                } else {
-                    c
-                }
-            })
-            .collect();
-        out.push(Entry {
-            label,
-            name,
-            path: p,
-            is_dir,
-            is_link,
-            size: meta.len(),
-            mtime: meta.mtime(),
-            mode: meta.mode(),
-            mime: mime_type,
-        });
+        if let Ok(e) = read_one(&item.path(), mime) {
+            out.push(e);
+        }
     }
     sort(&mut out, SortKey::Name, false);
     Ok(out)
+}
+
+/// One item: its own metadata, and for a link what it points at.
+pub fn read_one(p: &Path, mime: &crate::mime::Mime) -> std::io::Result<Entry> {
+    let name = p
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| p.display().to_string());
+    let lmeta = std::fs::symlink_metadata(p)?;
+    let is_link = lmeta.file_type().is_symlink();
+    // A link shows what it points at; a broken link stays a link.
+    let meta = if is_link {
+        std::fs::metadata(p).unwrap_or(lmeta)
+    } else {
+        lmeta
+    };
+    let is_dir = meta.is_dir();
+    let mime_type = if is_dir {
+        "inode/directory".to_string()
+    } else {
+        mime.for_name(&name).to_string()
+    };
+    let label: String = name
+        .chars()
+        .map(|c| {
+            if c.is_control() || c == '\u{fffd}' {
+                '?'
+            } else {
+                c
+            }
+        })
+        .collect();
+    Ok(Entry {
+        label,
+        name,
+        path: p.to_path_buf(),
+        is_dir,
+        is_link,
+        size: meta.len(),
+        mtime: meta.mtime(),
+        mode: meta.mode(),
+        mime: mime_type,
+    })
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
