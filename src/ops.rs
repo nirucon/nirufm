@@ -48,6 +48,13 @@ pub enum Job {
     Eject {
         dev: String,
     },
+    Connect {
+        uri: String,
+        login: Option<(String, String)>,
+    },
+    Disconnect {
+        uri: String,
+    },
 }
 
 impl Job {
@@ -62,6 +69,8 @@ impl Job {
             Job::Compress { .. } => "Packing",
             Job::Mount { .. } => "Mounting",
             Job::Eject { .. } => "Ejecting",
+            Job::Connect { .. } => "Connecting",
+            Job::Disconnect { .. } => "Disconnecting",
         }
     }
 }
@@ -90,6 +99,8 @@ pub enum Msg {
         created: Vec<PathBuf>,
         /// A folder to show when done (a drive that was just mounted).
         open: Option<PathBuf>,
+        /// The server at this URI wants a user name and password.
+        login: Option<String>,
     },
 }
 
@@ -113,8 +124,13 @@ pub fn start(out: Sender<Msg>, wake: i32) -> Worker {
                 cancel,
                 errors: Vec::new(),
                 last: std::time::Instant::now(),
+                needs_login: false,
             };
-            let mount = matches!(job, Job::Mount { .. });
+            let mount = matches!(job, Job::Mount { .. } | Job::Connect { .. });
+            let wants_login = match &job {
+                Job::Connect { uri, .. } => Some(uri.clone()),
+                _ => None,
+            };
             let (summary, undo, created) = run.job(job);
             let open = if mount {
                 created.first().cloned()
@@ -127,6 +143,7 @@ pub fn start(out: Sender<Msg>, wake: i32) -> Worker {
                 errors: run.errors,
                 created,
                 open,
+                login: wants_login.filter(|_| run.needs_login),
             });
             poke(wake);
         }
@@ -147,6 +164,7 @@ struct Run<'a> {
     cancel: Arc<AtomicBool>,
     errors: Vec<String>,
     last: std::time::Instant,
+    needs_login: bool,
 }
 
 impl Run<'_> {
@@ -315,6 +333,27 @@ impl Run<'_> {
                 Err(e) => {
                     self.fail(Path::new(&dev), e);
                     ("Mounting failed".into(), None, Vec::new())
+                }
+            },
+            Job::Connect { uri, login } => {
+                let l = login.as_ref().map(|(u, p)| (u.as_str(), p.as_str()));
+                match crate::remote::connect(&uri, l) {
+                    Ok(p) => (format!("Connected to {uri}"), None, vec![p]),
+                    Err(crate::remote::ConnectError::NeedsLogin) => {
+                        self.needs_login = true;
+                        ("The server wants a login".into(), None, Vec::new())
+                    }
+                    Err(crate::remote::ConnectError::Failed(e)) => {
+                        self.errors.push(format!("{uri}: {e}"));
+                        ("Connecting failed".into(), None, Vec::new())
+                    }
+                }
+            }
+            Job::Disconnect { uri } => match crate::remote::disconnect(&uri) {
+                Ok(()) => ("Disconnected".into(), None, Vec::new()),
+                Err(e) => {
+                    self.errors.push(format!("{uri}: {e}"));
+                    ("Disconnecting failed".into(), None, Vec::new())
                 }
             },
             Job::Eject { dev } => match crate::devices::eject(&dev) {

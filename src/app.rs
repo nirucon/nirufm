@@ -148,6 +148,20 @@ pub struct App {
     preview_rx: std::sync::mpsc::Receiver<Preview>,
     dev_watch: i32,
     mounts_fd: i32,
+    connect: Option<ConnectForm>,
+    menu_place: Option<usize>,
+    side_scroll: i32,
+    side_total: i32,
+}
+
+struct ConnectForm {
+    uri: String,
+    user: String,
+    pass: String,
+    /// 0 address, 1 user, 2 password.
+    field: usize,
+    login: bool,
+    note: Option<String>,
 }
 
 struct Preview {
@@ -185,6 +199,13 @@ enum Act {
     Terminal,
     Hidden,
     CopyPath,
+    Bookmark,
+    RemoveBookmark,
+    Connect,
+    NcPublic,
+    NcInternal,
+    NcShare,
+    NcBrowser,
 }
 
 struct Menu {
@@ -198,6 +219,8 @@ struct Confirm {
     text: String,
     job: crate::ops::Job,
 }
+
+static NET_WATCH: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(-2);
 
 const DOUBLE_CLICK: Duration = Duration::from_millis(400);
 
@@ -233,6 +256,17 @@ impl App {
         } else {
             -1
         };
+        if inotify >= 0 {
+            use std::os::unix::ffi::OsStrExt;
+            if let Ok(c) = std::ffi::CString::new(crate::remote::gvfs_root().as_os_str().as_bytes())
+            {
+                // Server mounts appear here; refresh the panel like for drives.
+                let wd = unsafe {
+                    libc::inotify_add_watch(inotify, c.as_ptr(), libc::IN_CREATE | libc::IN_DELETE)
+                };
+                NET_WATCH.store(wd, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
         let mounts_fd = unsafe {
             libc::open(
                 c"/proc/self/mounts".as_ptr(),
@@ -293,6 +327,10 @@ impl App {
             preview_rx,
             dev_watch,
             mounts_fd,
+            connect: None,
+            menu_place: None,
+            side_scroll: 0,
+            side_total: 0,
         };
         app.load_tab(0, true);
         app.x.map()?;
@@ -408,7 +446,9 @@ impl App {
             while off + hdr <= n as usize {
                 let ev: libc::inotify_event =
                     unsafe { std::ptr::read_unaligned(buf.as_ptr().add(off) as *const _) };
-                if ev.wd == self.dev_watch {
+                if ev.wd == self.dev_watch
+                    || ev.wd == NET_WATCH.load(std::sync::atomic::Ordering::Relaxed)
+                {
                     devices = true;
                 } else {
                     folder = true;
@@ -882,6 +922,16 @@ impl App {
         }
         if b == 3 {
             match self.hit(x, y) {
+                Some(Hit::Place(i)) if self.places.get(i).is_some_and(|p| p.bookmark) => {
+                    self.menu_place = Some(i);
+                    self.menu = Some(Menu {
+                        x,
+                        y,
+                        items: vec![("Remove bookmark".into(), Act::RemoveBookmark, "")],
+                        hover: None,
+                    });
+                    self.dirty = true;
+                }
                 Some(Hit::Item(i)) => {
                     if !self.tab().selected.get(i).copied().unwrap_or(false) {
                         self.set_cursor(i, false, false);
@@ -906,6 +956,13 @@ impl App {
                 }
                 return;
             }
+            4 | 5 if x < self.m.side_w => {
+                let max = (self.side_total - self.cv.h).max(0);
+                let d = if b == 4 { -step } else { step };
+                self.side_scroll = (self.side_scroll + d).clamp(0, max);
+                self.dirty = true;
+                return;
+            }
             4 | 5 => {
                 if self.content.contains(x, y) {
                     let d = if b == 4 { -step } else { step };
@@ -923,16 +980,35 @@ impl App {
         match (b, h) {
             (1, Hit::Place(i)) => {
                 if let Some(pl) = self.places.get(i).cloned() {
-                    match (&pl.dev, pl.mounted) {
-                        (Some(dev), false) => {
-                            self.submit(crate::ops::Job::Mount { dev: dev.clone() })
-                        }
-                        _ => self.go(pl.path),
+                    if pl.connect {
+                        self.open_connect(None, None);
+                    } else if let (Some(dev), false) = (&pl.dev, pl.mounted) {
+                        self.submit(crate::ops::Job::Mount { dev: dev.clone() });
+                    } else if let (Some(uri), false) = (&pl.uri, pl.mounted) {
+                        self.submit(crate::ops::Job::Connect {
+                            uri: uri.clone(),
+                            login: None,
+                        });
+                    } else {
+                        self.go(pl.path);
                     }
                 }
             }
             (1, Hit::Eject(i)) => {
                 if let Some(pl) = self.places.get(i).cloned() {
+                    if let (Some(uri), None) = (&pl.uri, &pl.dev) {
+                        for t in self
+                            .tabs
+                            .iter_mut()
+                            .filter(|t| t.path.starts_with(&pl.path))
+                        {
+                            t.path = theme::home();
+                        }
+                        let a = self.active;
+                        self.load_tab(a, true);
+                        self.submit(crate::ops::Job::Disconnect { uri: uri.clone() });
+                        return;
+                    }
                     if let Some(dev) = pl.dev {
                         // Leave the drive first, or it stays busy.
                         if self.tabs.iter().any(|t| t.path.starts_with(&pl.path)) {
@@ -1001,6 +1077,9 @@ impl App {
         let ctrl = state.contains(KeyButMask::CONTROL);
         let shift = state.contains(KeyButMask::SHIFT);
         let alt = state.contains(KeyButMask::MOD1);
+        if self.connect.is_some() {
+            return self.connect_key(sym, ctrl, shift);
+        }
         if self.confirm.is_some() {
             match sym {
                 0xff0d | 0xff8d | 0x79 | 0x6a => {
@@ -1159,6 +1238,8 @@ impl App {
             0x78 => self.act(Act::Cut),            // x
             0x76 => self.act(Act::Paste),          // v
             0x7a => self.undo_last(),              // z
+            0x6b => self.act(Act::Connect),        // k
+            0x64 => self.act(Act::Bookmark),       // d
             0x68 => {
                 // h
                 self.hidden = !self.hidden;
@@ -1344,6 +1425,7 @@ impl App {
         self.draw_menu();
         self.draw_preview();
         self.draw_confirm();
+        self.draw_connect();
     }
 
     fn draw_sidebar(&mut self) {
@@ -1365,17 +1447,19 @@ impl App {
             p.accent,
             Some(blend(p.surface, p.accent, 0.25)),
         );
-        let mut y = m.bar_h + m.pad / 2;
+        let mut y = m.bar_h + m.pad / 2 - self.side_scroll;
         let row = (m.font.height + m.pad).max(m.small_icon + m.pad / 2);
+        // The list scrolls under the logo row.
+        self.cv.set_clip(Rect::new(0, m.bar_h, sw, h - m.bar_h));
         let cur = self.tab().path.clone();
-        let mut devices_header = false;
+        let mut section = "";
         let (font, small, pad, si) = (m.font, m.small, m.pad, m.small_icon);
         for (i, pl) in self.places.clone().iter().enumerate() {
-            if pl.device && !devices_header {
-                devices_header = true;
+            if pl.section != section {
+                section = pl.section;
                 y += pad / 2;
                 self.text
-                    .draw(&mut self.cv, pad * 2, y, "DEVICES", small, p.muted);
+                    .draw(&mut self.cv, pad * 2, y, section, small, p.muted);
                 y += small.height + pad / 2;
             }
             let r = Rect::new(pad / 2, y, sw - pad, row);
@@ -1391,7 +1475,7 @@ impl App {
                 self.cv.image(pad * 2, y + (row - img.h) / 2, &img, 255);
             }
             let tx = pad * 3 + si;
-            let eject = pl.dev.is_some() && pl.mounted;
+            let eject = (pl.dev.is_some() || (pl.uri.is_some() && !pl.bookmark)) && pl.mounted;
             let ew = if eject {
                 self.text.width("⏏", font) + pad
             } else {
@@ -1438,6 +1522,15 @@ impl App {
                 self.hits.push(place_hit);
             }
             y += row;
+        }
+        self.side_total = y + self.side_scroll + pad;
+        self.cv.reset_clip();
+        // Rows scrolled under the logo row cannot be clicked.
+        let top = self.m.bar_h;
+        for (r, h) in self.hits.iter_mut() {
+            if matches!(h, Hit::Place(_) | Hit::Eject(_)) && r.y < top {
+                *r = r.intersect(&Rect::new(0, top, sw, self.cv.h));
+            }
         }
     }
 
@@ -2049,7 +2142,19 @@ impl App {
                     errors,
                     created,
                     open,
+                    login,
                 } => {
+                    if let Some(uri) = login {
+                        self.pending = self.pending.saturating_sub(1);
+                        if self.pending == 0 {
+                            self.running = None;
+                        }
+                        self.open_connect(
+                            Some(uri),
+                            Some("The server asks for a user name and password.".into()),
+                        );
+                        continue;
+                    }
                     self.pending = self.pending.saturating_sub(1);
                     if self.pending == 0 {
                         self.running = None;
@@ -2266,6 +2371,54 @@ impl App {
                 &[std::ffi::OsStr::new("--directory"), here.as_os_str()],
                 Some(&here),
             ),
+            Act::Bookmark => match crate::remote::add_bookmark(&here) {
+                Ok(true) => {
+                    self.flash(format!("Bookmarked {}", places::pretty(&here)));
+                    self.refresh_places();
+                }
+                Ok(false) => self.flash("Already bookmarked".into()),
+                Err(e) => self.flash_error(format!("Could not bookmark: {e}")),
+            },
+            Act::RemoveBookmark => {
+                if let Some(pl) = self
+                    .menu_place
+                    .take()
+                    .and_then(|i| self.places.get(i).cloned())
+                {
+                    let uri = pl
+                        .uri
+                        .clone()
+                        .unwrap_or_else(|| crate::x::file_uri(&pl.path));
+                    let _ = crate::remote::remove_bookmark(&uri);
+                    self.refresh_places();
+                }
+            }
+            Act::Connect => self.open_connect(None, None),
+            Act::NcPublic | Act::NcInternal | Act::NcShare | Act::NcBrowser => {
+                let Some(p) = sel.first() else { return };
+                let (cmd, done) = match a {
+                    Act::NcPublic => (
+                        crate::nextcloud::Command::PublicLink,
+                        "Nextcloud copies the public link",
+                    ),
+                    Act::NcInternal => (
+                        crate::nextcloud::Command::InternalLink,
+                        "Nextcloud copies the internal link",
+                    ),
+                    Act::NcShare => (
+                        crate::nextcloud::Command::Share,
+                        "Opening Nextcloud sharing",
+                    ),
+                    _ => (
+                        crate::nextcloud::Command::OpenInBrowser,
+                        "Opening in the browser",
+                    ),
+                };
+                match crate::nextcloud::send(cmd, p) {
+                    Ok(()) => self.flash(done.into()),
+                    Err(e) => self.flash_error(format!("Nextcloud: {e}")),
+                }
+            }
             Act::Hidden => {
                 self.hidden = !self.hidden;
                 let a = self.active;
@@ -2422,6 +2575,15 @@ impl App {
                 items.push(("Copy path".into(), Act::CopyPath, "Ctrl+Shift+C"));
                 if sel.len() == 1 {
                     items.push(("Rename".into(), Act::Rename, "F2"));
+                }
+                if sel.len() == 1
+                    && crate::nextcloud::in_sync_folder(&sel[0])
+                    && crate::nextcloud::running()
+                {
+                    items.push(("Copy public link".into(), Act::NcPublic, "Nextcloud"));
+                    items.push(("Copy internal link".into(), Act::NcInternal, "Nextcloud"));
+                    items.push(("Share…".into(), Act::NcShare, "Nextcloud"));
+                    items.push(("Open in Nextcloud".into(), Act::NcBrowser, "browser"));
                 }
                 if sel
                     .iter()
@@ -2987,6 +3149,182 @@ fn make_preview(e: &Entry, types: &std::collections::HashMap<String, ()>, max: u
         }
     }
     pv
+}
+
+impl App {
+    fn open_connect(&mut self, uri: Option<String>, note: Option<String>) {
+        let login = uri.is_some() && note.is_some();
+        let uri = uri.unwrap_or_else(|| "sftp://".into());
+        let user = std::env::var("USER").unwrap_or_default();
+        self.connect = Some(ConnectForm {
+            uri,
+            user,
+            pass: String::new(),
+            field: if login { 2 } else { 0 },
+            login,
+            note,
+        });
+        self.dirty = true;
+    }
+
+    fn connect_key(&mut self, sym: u32, ctrl: bool, shift: bool) {
+        let Some(f) = self.connect.as_mut() else {
+            return;
+        };
+        let fields = if f.login { 3 } else { 1 };
+        match sym {
+            0xff1b => self.connect = None,
+            0xff09 | 0xfe20 => {
+                // Tab: complete a host from ~/.ssh/config, or move field.
+                if f.field == 0 && f.uri.starts_with("sftp://") && !shift {
+                    let typed = f.uri["sftp://".len()..].to_string();
+                    let hosts = crate::remote::ssh_hosts();
+                    let mut hits: Vec<&String> =
+                        hosts.iter().filter(|h| h.starts_with(&typed)).collect();
+                    hits.sort();
+                    if let Some(h) = hits.first() {
+                        f.uri = format!("sftp://{h}");
+                    }
+                } else if fields > 1 {
+                    f.field = if shift {
+                        (f.field + fields - 1) % fields
+                    } else {
+                        (f.field + 1) % fields
+                    };
+                }
+            }
+            0xff0d | 0xff8d => {
+                let uri = f.uri.trim().to_string();
+                if !uri.contains("://") || uri.ends_with("://") {
+                    f.note = Some(
+                        "Type an address like sftp://host, ftp://host or smb://host/share".into(),
+                    );
+                } else {
+                    let login = f.login.then(|| (f.user.clone(), f.pass.clone()));
+                    self.connect = None;
+                    self.submit(crate::ops::Job::Connect { uri, login });
+                }
+            }
+            0xff08 => {
+                let buf = match f.field {
+                    0 => &mut f.uri,
+                    1 => &mut f.user,
+                    _ => &mut f.pass,
+                };
+                if ctrl {
+                    buf.clear();
+                } else {
+                    buf.pop();
+                }
+            }
+            _ => {
+                if let Some(c) = keysym_char(sym) {
+                    if !c.is_control() {
+                        match f.field {
+                            0 => f.uri.push(c),
+                            1 => f.user.push(c),
+                            _ => f.pass.push(c),
+                        }
+                    }
+                }
+            }
+        }
+        self.dirty = true;
+    }
+
+    fn draw_connect(&mut self) {
+        let Some(f) = self.connect.as_ref() else {
+            return;
+        };
+        let p = self.p;
+        let (font, small, pad) = (self.m.font, self.m.small, self.m.pad);
+        let (uri, user, pass, field, login, note) = (
+            f.uri.clone(),
+            f.user.clone(),
+            f.pass.clone(),
+            f.field,
+            f.login,
+            f.note.clone(),
+        );
+        let w = (self.cv.w * 2 / 3)
+            .clamp((380.0 * self.m.s) as i32, (640.0 * self.m.s) as i32)
+            .min(self.cv.w - 2 * pad);
+        let rows = if login { 3 } else { 1 };
+        let field_h = font.height + pad;
+        let h = 4 * pad
+            + font.height
+            + rows * (field_h + small.height + pad)
+            + 2 * small.height
+            + 2 * pad;
+        let r = Rect::new((self.cv.w - w) / 2, (self.cv.h - h) / 3, w, h);
+        self.cv
+            .tint(Rect::new(0, 0, self.cv.w, self.cv.h), p.background, 140);
+        let sh = (4.0 * self.m.s) as i32;
+        self.cv
+            .tint(Rect::new(r.x + sh, r.y + sh, r.w, r.h), 0x000000, 120);
+        self.cv.fill(r, p.surface);
+        self.cv.frame(r, p.accent);
+        let mut y = r.y + 2 * pad;
+        crate::logo::word(
+            &mut self.cv,
+            r.x + 2 * pad,
+            y,
+            "CONNECT",
+            (2.0 * self.m.s).round().max(2.0) as i32,
+            p.accent,
+            None,
+        );
+        y += font.height + pad;
+        let labels = ["Address", "User", "Password"];
+        for (k, label) in labels.iter().enumerate().take(rows as usize) {
+            self.text
+                .draw(&mut self.cv, r.x + 2 * pad, y, label, small, p.muted);
+            y += small.height + pad / 3;
+            let fr = Rect::new(r.x + 2 * pad, y, r.w - 4 * pad, field_h);
+            self.cv.fill(fr, p.background);
+            self.cv
+                .frame(fr, if k == field { p.accent } else { p.border });
+            let value = match k {
+                0 => uri.clone(),
+                1 => user.clone(),
+                _ => "•".repeat(pass.chars().count()),
+            };
+            let shown = if k == field {
+                format!("{value}▏")
+            } else {
+                value
+            };
+            let shown = self.text.ellipsize(&shown, font, fr.w - 2 * pad);
+            self.text.draw(
+                &mut self.cv,
+                fr.x + pad,
+                fr.y + (fr.h - font.height) / 2,
+                &shown,
+                font,
+                p.foreground,
+            );
+            y += field_h + pad;
+        }
+        let hint =
+            note.unwrap_or_else(|| "sftp://host  ftp://host  smb://host/share  davs://host".into());
+        let hint = self.text.ellipsize(&hint, small, r.w - 4 * pad);
+        self.text.draw(
+            &mut self.cv,
+            r.x + 2 * pad,
+            y,
+            &hint,
+            small,
+            if login { p.warning } else { p.muted },
+        );
+        y += small.height + pad / 2;
+        let keys = if login {
+            "Enter connect · Tab next field · Esc cancel"
+        } else {
+            "Enter connect · Tab completes an SSH host · Esc cancel"
+        };
+        self.text
+            .draw(&mut self.cv, r.x + 2 * pad, y, keys, small, p.muted);
+    }
 }
 
 /// Icon sizes of the zoom steps (Ctrl+wheel, Ctrl+plus/minus).

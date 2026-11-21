@@ -11,6 +11,30 @@ pub struct Place {
     /// A removable drive: its block device, for mounting and ejecting.
     pub dev: Option<String>,
     pub mounted: bool,
+    /// A server: its URI, to connect (bookmark) or disconnect (mounted).
+    pub uri: Option<String>,
+    /// The "Connect to server" row.
+    pub connect: bool,
+    /// The heading this row is listed under ("" for the first group).
+    pub section: &'static str,
+    pub bookmark: bool,
+}
+
+impl Place {
+    fn local(label: &str, path: PathBuf, icon: &'static str) -> Self {
+        Place {
+            label: label.into(),
+            path,
+            icon,
+            device: false,
+            dev: None,
+            mounted: true,
+            uri: None,
+            connect: false,
+            section: "",
+            bookmark: false,
+        }
+    }
 }
 
 /// `~/.config/user-dirs.dirs`: XDG_DOWNLOAD_DIR="$HOME/Downloads".
@@ -40,14 +64,7 @@ pub fn places() -> Vec<Place> {
             .map(|(_, p)| p.clone())
             .unwrap_or_else(|| home.join(fallback))
     };
-    let mut v = vec![Place {
-        label: "Home".into(),
-        path: home.clone(),
-        icon: "user-home",
-        device: false,
-        dev: None,
-        mounted: true,
-    }];
+    let mut v = vec![Place::local("Home", home.clone(), "user-home")];
     for (key, fallback, label, icon) in [
         ("DESKTOP", "Desktop", "Desktop", "user-desktop"),
         ("DOCUMENTS", "Documents", "Documents", "folder-documents"),
@@ -58,45 +75,64 @@ pub fn places() -> Vec<Place> {
     ] {
         let p = dir(key, fallback);
         if p.is_dir() && p != home {
-            v.push(Place {
-                label: label.into(),
-                path: p,
-                icon,
-                device: false,
-                dev: None,
-                mounted: true,
-            });
+            v.push(Place::local(label, p, icon));
         }
     }
-    let nc = home.join("Nextcloud");
-    if nc.is_dir() {
-        v.push(Place {
-            label: "Nextcloud".into(),
-            path: nc,
-            icon: "folder-nextcloud",
-            device: false,
-            dev: None,
-            mounted: true,
-        });
+    for nc in crate::nextcloud::sync_folders() {
+        let label = if nc == home.join("Nextcloud") {
+            "Nextcloud".to_string()
+        } else {
+            nc.file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_else(|| "Nextcloud".into())
+        };
+        v.push(Place::local(&label, nc, "folder-nextcloud"));
     }
-    let trash = trash_files();
-    v.push(Place {
-        label: "Trash".into(),
-        path: trash,
-        icon: "user-trash",
-        device: false,
-        dev: None,
-        mounted: true,
-    });
-    v.push(Place {
-        label: "File system".into(),
-        path: PathBuf::from("/"),
-        icon: "drive-harddisk",
-        device: false,
-        dev: None,
-        mounted: true,
-    });
+    if !v.iter().any(|p| p.icon == "folder-nextcloud") && home.join("Nextcloud").is_dir() {
+        v.push(Place::local(
+            "Nextcloud",
+            home.join("Nextcloud"),
+            "folder-nextcloud",
+        ));
+    }
+    v.push(Place::local("Trash", trash_files(), "user-trash"));
+    v.push(Place::local(
+        "File system",
+        PathBuf::from("/"),
+        "drive-harddisk",
+    ));
+    for b in crate::remote::bookmarks() {
+        let local = b.uri.strip_prefix("file://").map(crate::ops::decode_path);
+        let mut pl = Place::local(&b.label, local.clone().unwrap_or_default(), "folder");
+        pl.section = "BOOKMARKS";
+        pl.bookmark = true;
+        if local.is_none() {
+            pl.uri = Some(b.uri.clone());
+            pl.icon = "folder-remote";
+            pl.mounted = false;
+            // A server bookmark that is connected opens its folder.
+            if let Some(m) = crate::remote::mounted()
+                .into_iter()
+                .find(|m| b.uri.starts_with(&m.uri))
+            {
+                pl.path = m.path;
+                pl.mounted = true;
+            }
+        }
+        v.push(pl);
+    }
     v.extend(drives());
+    for m in crate::remote::mounted() {
+        let mut pl = Place::local(&m.label, m.path, "network-server");
+        pl.section = "NETWORK";
+        pl.uri = Some(m.uri);
+        v.push(pl);
+    }
+    let mut c = Place::local("Connect to server…", PathBuf::new(), "network-workgroup");
+    c.section = "NETWORK";
+    c.connect = true;
+    c.mounted = false;
+    v.push(c);
     v
 }
 
@@ -147,6 +183,10 @@ pub fn drives() -> Vec<Place> {
             device: true,
             dev: None,
             mounted: true,
+            uri: None,
+            connect: false,
+            section: "DEVICES",
+            bookmark: false,
         });
     }
     for d in removable {
@@ -161,6 +201,10 @@ pub fn drives() -> Vec<Place> {
             icon,
             device: true,
             mounted: d.mount.is_some(),
+            uri: None,
+            connect: false,
+            section: "DEVICES",
+            bookmark: false,
             dev: Some(d.dev),
         });
     }
