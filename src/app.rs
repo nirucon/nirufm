@@ -336,6 +336,9 @@ struct Confirm {
 
 static NET_WATCH: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(-2);
 
+/// The search text that marks the Recent view.
+const RECENT: &str = "recent files";
+
 const DOUBLE_CLICK: Duration = Duration::from_millis(400);
 
 impl App {
@@ -1898,7 +1901,14 @@ impl App {
                 y += small.height + pad / 2;
             }
             let r = Rect::new(pad / 2, y, sw - pad, row);
-            if cur == pl.path {
+            // Recent shows files from everywhere: only its own row is marked.
+            let recent = self.tab().search.as_deref() == Some(RECENT);
+            let here = if recent {
+                pl.icon == "document-open-recent"
+            } else {
+                pl.mounted && !pl.path.as_os_str().is_empty() && cur == pl.path
+            };
+            if here {
                 self.cv.fill(r, p.selected);
                 self.cv.fill(
                     Rect::new(r.x, r.y, (2.0 * self.m.s).max(2.0) as i32, r.h),
@@ -1917,7 +1927,7 @@ impl App {
                 0
             };
             let label = self.text.ellipsize(&pl.label, font, sw - tx - pad - ew);
-            let col = if cur == pl.path && pl.mounted {
+            let col = if here {
                 p.foreground
             } else if !pl.mounted {
                 p.muted
@@ -2034,7 +2044,12 @@ impl App {
                     p.border
                 },
             );
-            let label = format!("Search {}: ", places::pretty(&self.tab().path));
+            let label = if q == RECENT {
+                "Recently used files".to_string()
+            } else {
+                format!("Search {}: ", places::pretty(&self.tab().path))
+            };
+            let q = if q == RECENT { String::new() } else { q };
             let lw = self
                 .text
                 .draw(&mut self.cv, r.x + pad, ty, &label, font, p.muted);
@@ -5648,7 +5663,7 @@ impl App {
         let home = theme::home();
         let t = self.tab_mut();
         t.path = home;
-        t.search = Some("recent files".into());
+        t.search = Some(RECENT.into());
         t.all = entries;
         t.shown = (0..t.all.len()).collect();
         t.selected = vec![false; t.all.len()];
