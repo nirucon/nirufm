@@ -8,6 +8,9 @@ pub struct Place {
     pub path: PathBuf,
     pub icon: &'static str,
     pub device: bool,
+    /// A removable drive: its block device, for mounting and ejecting.
+    pub dev: Option<String>,
+    pub mounted: bool,
 }
 
 /// `~/.config/user-dirs.dirs`: XDG_DOWNLOAD_DIR="$HOME/Downloads".
@@ -42,6 +45,8 @@ pub fn places() -> Vec<Place> {
         path: home.clone(),
         icon: "user-home",
         device: false,
+        dev: None,
+        mounted: true,
     }];
     for (key, fallback, label, icon) in [
         ("DESKTOP", "Desktop", "Desktop", "user-desktop"),
@@ -58,6 +63,8 @@ pub fn places() -> Vec<Place> {
                 path: p,
                 icon,
                 device: false,
+                dev: None,
+                mounted: true,
             });
         }
     }
@@ -68,6 +75,8 @@ pub fn places() -> Vec<Place> {
             path: nc,
             icon: "folder-nextcloud",
             device: false,
+            dev: None,
+            mounted: true,
         });
     }
     let trash = trash_files();
@@ -76,12 +85,16 @@ pub fn places() -> Vec<Place> {
         path: trash,
         icon: "user-trash",
         device: false,
+        dev: None,
+        mounted: true,
     });
     v.push(Place {
         label: "File system".into(),
         path: PathBuf::from("/"),
         icon: "drive-harddisk",
         device: false,
+        dev: None,
+        mounted: true,
     });
     v.extend(drives());
     v
@@ -98,6 +111,7 @@ pub fn trash_files() -> PathBuf {
 pub fn drives() -> Vec<Place> {
     let text = std::fs::read_to_string("/proc/self/mounts").unwrap_or_default();
     let mut v = Vec::new();
+    let removable = crate::devices::removable();
     for line in text.lines() {
         let mut f = line.split_whitespace();
         let (Some(dev), Some(mnt)) = (f.next(), f.next()) else {
@@ -119,11 +133,35 @@ pub fn drives() -> Vec<Place> {
         } else {
             "drive-removable-media"
         };
+        // A plugged-in drive is listed below with its eject button.
+        if removable
+            .iter()
+            .any(|d| d.mount.as_deref() == Some(Path::new(&mnt)))
+        {
+            continue;
+        }
         v.push(Place {
             label,
             path: PathBuf::from(mnt),
             icon,
             device: true,
+            dev: None,
+            mounted: true,
+        });
+    }
+    for d in removable {
+        let icon = if d.dev.contains("mmcblk") {
+            "media-flash"
+        } else {
+            "drive-removable-media-usb"
+        };
+        v.push(Place {
+            label: d.label.clone(),
+            path: d.mount.clone().unwrap_or_default(),
+            icon,
+            device: true,
+            mounted: d.mount.is_some(),
+            dev: Some(d.dev),
         });
     }
     v

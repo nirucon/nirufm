@@ -2,6 +2,7 @@
 mod app;
 mod archive;
 mod canvas;
+mod devices;
 mod dir;
 mod icons;
 mod logo;
@@ -10,6 +11,7 @@ mod ops;
 mod places;
 mod text;
 mod theme;
+mod thumbs;
 mod x;
 
 use std::path::PathBuf;

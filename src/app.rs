@@ -74,6 +74,7 @@ enum Hit {
     Header(SortKey),
     Content,
     MenuItem(usize),
+    Eject(usize),
     MenuOutside,
 }
 
@@ -137,6 +138,24 @@ pub struct App {
     confirm: Option<Confirm>,
     rename: Option<(usize, String)>,
     select_after: Vec<PathBuf>,
+    zoom: usize,
+    font_px: f32,
+    thumbs: crate::thumbs::Thumbs,
+    thumb_types: std::collections::HashMap<String, ()>,
+    thumb_img: std::collections::HashMap<PathBuf, Option<std::rc::Rc<crate::canvas::Image>>>,
+    preview: Option<Preview>,
+    preview_tx: std::sync::mpsc::Sender<Preview>,
+    preview_rx: std::sync::mpsc::Receiver<Preview>,
+    dev_watch: i32,
+    mounts_fd: i32,
+}
+
+struct Preview {
+    path: PathBuf,
+    image: Option<crate::canvas::Image>,
+    lines: Vec<String>,
+    note: Option<String>,
+    ready: bool,
 }
 
 struct Running {
@@ -188,7 +207,7 @@ impl App {
         let font_px = theme::configured_font_size(&base).unwrap_or(15.0);
         let text = Text::new(theme::configured_font_path(&base).as_deref())?;
         let s = (font_px / 15.0).clamp(0.6, 3.0);
-        let m = metrics(&text, font_px, s);
+        let m = metrics(&text, font_px, s, ZOOM_DEFAULT);
         let x = X::open((1120.0 * s) as u16, (720.0 * s) as u16, "NIRUFM")?;
         let theme_name = x
             .root_theme()
@@ -199,6 +218,27 @@ impl App {
         let wake = unsafe { libc::eventfd(0, libc::EFD_NONBLOCK | libc::EFD_CLOEXEC) };
         let (tx, rx) = std::sync::mpsc::channel();
         let worker = crate::ops::start(tx, wake);
+        let (thumbs, thumb_types) = crate::thumbs::Thumbs::start(wake);
+        let (preview_tx, preview_rx) = std::sync::mpsc::channel();
+        // A drive plugged in or pulled out shows up in /dev/disk/by-id;
+        // a mount or unmount makes /proc/self/mounts readable with POLLPRI.
+        let dev_watch = if inotify >= 0 {
+            unsafe {
+                libc::inotify_add_watch(
+                    inotify,
+                    c"/dev/disk/by-id".as_ptr(),
+                    libc::IN_CREATE | libc::IN_DELETE,
+                )
+            }
+        } else {
+            -1
+        };
+        let mounts_fd = unsafe {
+            libc::open(
+                c"/proc/self/mounts".as_ptr(),
+                libc::O_RDONLY | libc::O_CLOEXEC,
+            )
+        };
         let mut app = App {
             cv: Canvas::new((1120.0 * s) as i32, (720.0 * s) as i32),
             icons: Icons::new(p.is_light()),
@@ -243,6 +283,16 @@ impl App {
             confirm: None,
             rename: None,
             select_after: Vec::new(),
+            zoom: ZOOM_DEFAULT,
+            font_px,
+            thumbs,
+            thumb_types,
+            thumb_img: std::collections::HashMap::new(),
+            preview: None,
+            preview_tx,
+            preview_rx,
+            dev_watch,
+            mounts_fd,
         };
         app.load_tab(0, true);
         app.x.map()?;
@@ -278,6 +328,10 @@ impl App {
                 .collect()
         };
         let path = self.tabs[i].path.clone();
+        if reset {
+            self.thumbs.clear();
+            self.thumb_img.clear();
+        }
         let (all, error) = match dir::read(&path, &self.mime) {
             Ok(mut v) => {
                 dir::sort(&mut v, self.sort, self.reverse);
@@ -337,7 +391,7 @@ impl App {
 
     fn drain_inotify(&mut self) {
         let mut buf = [0u8; 4096];
-        let mut any = false;
+        let (mut folder, mut devices) = (false, false);
         loop {
             let n = unsafe {
                 libc::read(
@@ -349,12 +403,34 @@ impl App {
             if n <= 0 {
                 break;
             }
-            any = true;
+            let mut off = 0usize;
+            let hdr = std::mem::size_of::<libc::inotify_event>();
+            while off + hdr <= n as usize {
+                let ev: libc::inotify_event =
+                    unsafe { std::ptr::read_unaligned(buf.as_ptr().add(off) as *const _) };
+                if ev.wd == self.dev_watch {
+                    devices = true;
+                } else {
+                    folder = true;
+                }
+                off += hdr + ev.len as usize;
+            }
         }
-        if any {
+        if folder {
             // Many events arrive for one copy: reload once, a moment later.
             self.reload_at
                 .get_or_insert(Instant::now() + Duration::from_millis(120));
+        }
+        if devices {
+            self.refresh_places();
+        }
+    }
+
+    fn refresh_places(&mut self) {
+        let p = places::places();
+        if p != self.places {
+            self.places = p;
+            self.dirty = true;
         }
     }
 
@@ -651,7 +727,7 @@ impl App {
                     + 1;
                 timeout = if timeout < 0 { left } else { timeout.min(left) };
             }
-            let mut fds = [
+            let fds = [
                 libc::pollfd {
                     fd: xfd,
                     events: libc::POLLIN,
@@ -668,8 +744,26 @@ impl App {
                     revents: 0,
                 },
             ];
+            let mut fds4 = [
+                fds[0],
+                fds[1],
+                fds[2],
+                libc::pollfd {
+                    fd: self.mounts_fd,
+                    events: libc::POLLPRI,
+                    revents: 0,
+                },
+            ];
             let n = if self.inotify >= 0 { 3 } else { 2 };
-            unsafe { libc::poll(fds.as_mut_ptr(), n, timeout) };
+            let total = if self.mounts_fd >= 0 { 4 } else { n };
+            if self.inotify < 0 {
+                fds4[2] = fds4[3];
+            }
+            unsafe { libc::poll(fds4.as_mut_ptr(), total as libc::nfds_t, timeout) };
+            let fds = [fds4[0], fds4[1], fds4[2]];
+            if self.mounts_fd >= 0 && fds4[3].revents & (libc::POLLPRI | libc::POLLERR) != 0 {
+                self.refresh_places();
+            }
             if fds[1].revents & libc::POLLIN != 0 {
                 let mut v = 0u64;
                 unsafe { libc::read(self.wake, &mut v as *mut u64 as *mut libc::c_void, 8) };
@@ -761,6 +855,11 @@ impl App {
         if self.confirm.is_some() {
             return;
         }
+        if self.preview.is_some() {
+            self.preview = None;
+            self.dirty = true;
+            return;
+        }
         if self.menu.is_some() {
             if let (1 | 3, Some(Hit::MenuItem(i))) = (b, self.hit(x, y)) {
                 let act = self
@@ -799,6 +898,14 @@ impl App {
         }
         let step = self.m.row_h * 3;
         match b {
+            4 | 5 if ctrl => {
+                if b == 4 {
+                    self.set_zoom(self.zoom + 1);
+                } else {
+                    self.set_zoom(self.zoom.saturating_sub(1));
+                }
+                return;
+            }
             4 | 5 => {
                 if self.content.contains(x, y) {
                     let d = if b == 4 { -step } else { step };
@@ -815,8 +922,32 @@ impl App {
         let Some(h) = self.hit(x, y) else { return };
         match (b, h) {
             (1, Hit::Place(i)) => {
-                if let Some(p) = self.places.get(i).map(|p| p.path.clone()) {
-                    self.go(p);
+                if let Some(pl) = self.places.get(i).cloned() {
+                    match (&pl.dev, pl.mounted) {
+                        (Some(dev), false) => {
+                            self.submit(crate::ops::Job::Mount { dev: dev.clone() })
+                        }
+                        _ => self.go(pl.path),
+                    }
+                }
+            }
+            (1, Hit::Eject(i)) => {
+                if let Some(pl) = self.places.get(i).cloned() {
+                    if let Some(dev) = pl.dev {
+                        // Leave the drive first, or it stays busy.
+                        if self.tabs.iter().any(|t| t.path.starts_with(&pl.path)) {
+                            for t in self
+                                .tabs
+                                .iter_mut()
+                                .filter(|t| t.path.starts_with(&pl.path))
+                            {
+                                t.path = theme::home();
+                            }
+                            let a = self.active;
+                            self.load_tab(a, true);
+                        }
+                        self.submit(crate::ops::Job::Eject { dev });
+                    }
                 }
             }
             (2, Hit::Place(i)) => {
@@ -904,6 +1035,9 @@ impl App {
         if self.rename.is_some() {
             return self.rename_key(sym, ctrl);
         }
+        if self.preview.is_some() {
+            return self.preview_key(sym);
+        }
         if self.path_edit.is_some() {
             return self.path_key(sym, ctrl);
         }
@@ -935,6 +1069,12 @@ impl App {
                 }
             }
             0xffbf => self.act(Act::Rename), // F2
+            0x20 if !ctrl
+                && (self.typed.is_empty()
+                    || self.typed_at.elapsed() > Duration::from_millis(900)) =>
+            {
+                self.toggle_preview()
+            }
             0xff67 => {
                 // Menu key: the context menu at the cursor.
                 let c = self.tab().cursor;
@@ -1043,6 +1183,9 @@ impl App {
             }
             0x6e if shift => self.act(Act::NewFolder),
             _ => match sym {
+                0x2b | 0x3d | 0xffab => self.set_zoom(self.zoom + 1), // + = KP_Add
+                0x2d | 0xffad => self.set_zoom(self.zoom.saturating_sub(1)), // - KP_Subtract
+                0x30 => self.set_zoom(ZOOM_DEFAULT),
                 0x31 => self.set_view(View::Icons), // 1
                 0x32 => self.set_view(View::List),  // 2
                 0xff56 => {
@@ -1199,6 +1342,7 @@ impl App {
         self.draw_status();
         self.draw_rename();
         self.draw_menu();
+        self.draw_preview();
         self.draw_confirm();
     }
 
@@ -1247,12 +1391,33 @@ impl App {
                 self.cv.image(pad * 2, y + (row - img.h) / 2, &img, 255);
             }
             let tx = pad * 3 + si;
-            let label = self.text.ellipsize(&pl.label, font, sw - tx - pad);
-            let col = if cur == pl.path {
+            let eject = pl.dev.is_some() && pl.mounted;
+            let ew = if eject {
+                self.text.width("⏏", font) + pad
+            } else {
+                0
+            };
+            let label = self.text.ellipsize(&pl.label, font, sw - tx - pad - ew);
+            let col = if cur == pl.path && pl.mounted {
                 p.foreground
+            } else if !pl.mounted {
+                p.muted
             } else {
                 blend(p.muted, p.foreground, 0.45)
             };
+            if eject {
+                let ex = sw - pad - ew;
+                self.text.draw(
+                    &mut self.cv,
+                    ex,
+                    y + (row - font.height) / 2,
+                    "⏏",
+                    font,
+                    p.muted,
+                );
+                self.hits
+                    .push((Rect::new(ex - pad / 2, y, ew + pad / 2, row), Hit::Eject(i)));
+            }
             self.text.draw(
                 &mut self.cv,
                 tx,
@@ -1261,7 +1426,17 @@ impl App {
                 font,
                 col,
             );
-            self.hits.push((r, Hit::Place(i)));
+            let place_hit = (r, Hit::Place(i));
+            // The eject button sits on the row: it is pushed after it.
+            if let Some(pos) = self
+                .hits
+                .iter()
+                .rposition(|(_, h)| matches!(h, Hit::Eject(k) if *k == i))
+            {
+                self.hits.insert(pos, place_hit);
+            } else {
+                self.hits.push(place_hit);
+            }
             y += row;
         }
     }
@@ -1443,7 +1618,12 @@ impl App {
         self.hits.push((c, Hit::Content));
         self.cv.set_clip(c);
         if let Some(err) = self.tab().error.clone() {
-            crate::logo::splash(&mut self.cv, c, &p, "NO ACCESS");
+            let tag = if err.contains("os error 2") {
+                "NOT FOUND"
+            } else {
+                "NO ACCESS"
+            };
+            crate::logo::splash(&mut self.cv, c, &p, tag);
             let small = self.m.small;
             let tw = self.text.width(&err, small);
             self.text.draw(
@@ -1521,7 +1701,14 @@ impl App {
             if i == cursor {
                 self.cv.frame(inner, if sel { p.accent } else { p.border });
             }
-            if let Some(img) = self.icon_for(&e, icon) {
+            let thumb = self.thumb_for(&e);
+            if let Some(img) = thumb {
+                // A thin frame makes photos read as pictures, not icons.
+                let (tx, ty) = (r.x + (r.w - img.w) / 2, r.y + pad + (icon - img.h));
+                self.cv
+                    .frame(Rect::new(tx - 1, ty - 1, img.w + 2, img.h + 2), p.border);
+                self.cv.image(tx, ty, &img, 255);
+            } else if let Some(img) = self.icon_for(&e, icon) {
                 let alpha = if e.hidden() { 150 } else { 255 };
                 self.cv
                     .image(r.x + (r.w - img.w) / 2, r.y + pad, &img, alpha);
@@ -1829,6 +2016,20 @@ impl App {
     }
 
     fn worker_messages(&mut self) {
+        while let Ok(d) = self.thumbs.rx.try_recv() {
+            let fitted = d.image.map(|img| {
+                let b = self.m.icon;
+                std::rc::Rc::new(crate::icons::scale_to_fit(&img, b, b))
+            });
+            self.thumb_img.insert(d.path, fitted);
+            self.dirty = true;
+        }
+        while let Ok(pv) = self.preview_rx.try_recv() {
+            if self.preview.as_ref().is_some_and(|cur| cur.path == pv.path) {
+                self.preview = Some(pv);
+                self.dirty = true;
+            }
+        }
         while let Ok(m) = self.rx.try_recv() {
             match m {
                 crate::ops::Msg::Progress {
@@ -1847,6 +2048,7 @@ impl App {
                     undo,
                     errors,
                     created,
+                    open,
                 } => {
                     self.pending = self.pending.saturating_sub(1);
                     if self.pending == 0 {
@@ -1859,6 +2061,12 @@ impl App {
                         }
                     }
                     self.select_after = created;
+                    if let Some(dir) = open {
+                        self.refresh_places();
+                        self.go(dir);
+                    } else if summary == "Safe to remove" {
+                        self.refresh_places();
+                    }
                     if let Some(first) = errors.first() {
                         let more = if errors.len() > 1 {
                             format!(" (+{} more)", errors.len() - 1)
@@ -2410,24 +2618,387 @@ impl App {
     }
 }
 
-fn metrics(text: &Text, font_px: f32, s: f32) -> Metrics {
+impl App {
+    /// A thumbnail when there is one; asks for it the first time.
+    fn thumb_for(&mut self, e: &Entry) -> Option<std::rc::Rc<crate::canvas::Image>> {
+        if e.is_dir || !crate::thumbs::wanted(&e.mime, &self.thumb_types) || self.m.icon < 40 {
+            return None;
+        }
+        if let Some(hit) = self.thumb_img.get(&e.path) {
+            return hit.clone();
+        }
+        self.thumb_img.insert(e.path.clone(), None);
+        // Thumbnails of very large files are left to the preview.
+        if e.size > 512 * 1024 * 1024 {
+            return None;
+        }
+        self.thumbs.request(crate::thumbs::Request {
+            path: e.path.clone(),
+            mime: e.mime.clone(),
+            mtime: e.mtime,
+            size: self.m.icon.max(1) as u32,
+        });
+        None
+    }
+
+    fn set_zoom(&mut self, z: usize) {
+        let z = z.min(ZOOM.len() - 1);
+        if z == self.zoom {
+            return;
+        }
+        // Keep the item under the cursor in view.
+        self.zoom = z;
+        self.m = metrics(&self.text, self.font_px, self.m.s, z);
+        self.thumbs.clear();
+        self.thumb_img.clear();
+        self.layout_only();
+        self.reveal();
+        self.dirty = true;
+        self.flash(format!("Icons {} px", ZOOM[z] as i32));
+    }
+
+    fn toggle_preview(&mut self) {
+        if self.preview.is_some() {
+            self.preview = None;
+            self.dirty = true;
+            return;
+        }
+        self.start_preview();
+    }
+
+    fn start_preview(&mut self) {
+        let t = self.tab();
+        let Some(e) = t.entry(t.cursor).cloned() else {
+            return;
+        };
+        self.preview = Some(Preview {
+            path: e.path.clone(),
+            image: None,
+            lines: Vec::new(),
+            note: None,
+            ready: false,
+        });
+        self.dirty = true;
+        let tx = self.preview_tx.clone();
+        let wake = self.wake;
+        let types = self.thumb_types.clone();
+        let max = (self.cv.w.max(self.cv.h) as u32).clamp(400, 2048);
+        std::thread::spawn(move || {
+            let pv = make_preview(&e, &types, max);
+            let _ = tx.send(pv);
+            crate::ops::poke(wake);
+        });
+    }
+
+    fn preview_key(&mut self, sym: u32) {
+        let n = self.tab().shown.len();
+        let cur = self.tab().cursor;
+        let cols = if self.view == View::Icons {
+            self.cols.max(1) as usize
+        } else {
+            1
+        };
+        let next = match sym {
+            0x20 | 0xff1b => {
+                self.preview = None;
+                self.dirty = true;
+                return;
+            }
+            0xff0d | 0xff8d => {
+                self.preview = None;
+                self.open(cur);
+                return;
+            }
+            0xff51 => cur.saturating_sub(1),
+            0xff53 => (cur + 1).min(n.saturating_sub(1)),
+            0xff52 => cur.saturating_sub(cols),
+            0xff54 => (cur + cols).min(n.saturating_sub(1)),
+            _ => return,
+        };
+        if next != cur {
+            self.set_cursor(next, false, false);
+            self.start_preview();
+        }
+    }
+
+    fn draw_preview(&mut self) {
+        let Some(pv) = self.preview.as_ref() else {
+            return;
+        };
+        let p = self.p;
+        let (font, small, pad) = (self.m.font, self.m.small, self.m.pad);
+        let path = pv.path.clone();
+        let Some(e) = self.tab().all.iter().find(|e| e.path == path).cloned() else {
+            return;
+        };
+        let full = Rect::new(0, 0, self.cv.w, self.cv.h);
+        self.cv.tint(full, p.background, 170);
+        let margin = (self.cv.w.min(self.cv.h) / 16).max(2 * pad);
+        let r = Rect::new(
+            margin,
+            margin,
+            self.cv.w - 2 * margin,
+            self.cv.h - 2 * margin,
+        );
+        let sh = (5.0 * self.m.s) as i32;
+        self.cv
+            .tint(Rect::new(r.x + sh, r.y + sh, r.w, r.h), 0x000000, 120);
+        self.cv.fill(r, p.surface);
+        self.cv.frame(r, p.border);
+        // Title row.
+        let title_h = font.height + 2 * pad;
+        self.cv.fill(
+            Rect::new(r.x + 1, r.y + 1, r.w - 2, title_h),
+            blend(p.surface, p.background, 0.5),
+        );
+        let name = self.text.ellipsize(&e.label, font, r.w - 4 * pad);
+        self.text.draw(
+            &mut self.cv,
+            r.x + 2 * pad,
+            r.y + pad,
+            &name,
+            font,
+            p.foreground,
+        );
+        // Footer with facts and keys.
+        let foot_h = small.height + 2 * pad;
+        let fy = r.y + r.h - foot_h;
+        self.cv.fill(Rect::new(r.x + 1, fy, r.w - 2, 1), p.border);
+        let kind = if e.is_dir {
+            "folder".to_string()
+        } else {
+            e.mime.clone()
+        };
+        let facts = if e.is_dir {
+            format!("{kind} · {}", dir::human_time(e.mtime))
+        } else {
+            format!(
+                "{} · {kind} · {}",
+                dir::human_size(e.size),
+                dir::human_time(e.mtime)
+            )
+        };
+        self.text.draw(
+            &mut self.cv,
+            r.x + 2 * pad,
+            fy + pad,
+            &facts,
+            small,
+            p.muted,
+        );
+        let keys = "←→ next · Enter open · Space close";
+        let kw = self.text.width(keys, small);
+        self.text.draw(
+            &mut self.cv,
+            r.x + r.w - kw - 2 * pad,
+            fy + pad,
+            keys,
+            small,
+            p.border,
+        );
+        // Body.
+        let body = Rect::new(
+            r.x + 2 * pad,
+            r.y + title_h + pad,
+            r.w - 4 * pad,
+            r.h - title_h - foot_h - 2 * pad,
+        );
+        let pv = self.preview.as_ref().unwrap();
+        if let Some(img) = &pv.image {
+            let fitted = crate::icons::scale_to_fit(img, body.w, body.h);
+            let (ix, iy) = (
+                body.x + (body.w - fitted.w) / 2,
+                body.y + (body.h - fitted.h) / 2,
+            );
+            self.cv.fill(
+                Rect::new(ix - 1, iy - 1, fitted.w + 2, fitted.h + 2),
+                p.border,
+            );
+            self.cv
+                .fill(Rect::new(ix, iy, fitted.w, fitted.h), 0x808080);
+            self.cv.image(ix, iy, &fitted, 255);
+        } else if !pv.lines.is_empty() {
+            let lines = pv.lines.clone();
+            self.cv.set_clip(body);
+            let mut y = body.y;
+            for l in lines {
+                if y > body.y + body.h {
+                    break;
+                }
+                let l = l.replace('\t', "    ");
+                let l = self.text.ellipsize(&l, small, body.w);
+                self.text
+                    .draw(&mut self.cv, body.x, y, &l, small, p.foreground);
+                y += small.height;
+            }
+            self.cv.reset_clip();
+        } else {
+            let note = if !pv.ready {
+                "LOADING".to_string()
+            } else {
+                pv.note.clone().unwrap_or_else(|| "NO PREVIEW".into())
+            };
+            let big = (self.m.icon * 2).min(256);
+            if let Some(img) = self.icon_for(&e, big) {
+                self.cv.image(
+                    body.x + (body.w - img.w) / 2,
+                    body.y + body.h / 2 - img.h,
+                    &img,
+                    255,
+                );
+            }
+            let tw = self.text.width(&note, small);
+            self.text.draw(
+                &mut self.cv,
+                body.x + (body.w - tw) / 2,
+                body.y + body.h / 2 + pad,
+                &note,
+                small,
+                p.muted,
+            );
+        }
+    }
+}
+
+/// Build a preview off the main thread: a picture (thumbnailers, PNG, PDF
+/// through pdftoppm) or the first lines of a text file.
+fn make_preview(e: &Entry, types: &std::collections::HashMap<String, ()>, max: u32) -> Preview {
+    let mut pv = Preview {
+        path: e.path.clone(),
+        image: None,
+        lines: Vec::new(),
+        note: None,
+        ready: true,
+    };
+    if e.is_dir {
+        let n = std::fs::read_dir(&e.path).map(|rd| rd.count()).unwrap_or(0);
+        pv.note = Some(format!("{n} ITEMS"));
+        return pv;
+    }
+    let tmp = std::env::temp_dir().join(format!(
+        "nirufm-preview-{}-{}.png",
+        std::process::id(),
+        crate::thumbs::md5_hex(e.path.to_string_lossy().as_bytes())
+    ));
+    if e.mime == "image/png" {
+        if let Some(img) = std::fs::read(&e.path)
+            .ok()
+            .and_then(|d| crate::icons::decode_png(&d))
+        {
+            pv.image = Some(crate::icons::scale_to_fit(&img, max as i32, max as i32));
+            return pv;
+        }
+    }
+    if e.mime == "image/svg+xml" {
+        if let Some(img) = std::fs::read(&e.path)
+            .ok()
+            .and_then(|d| crate::icons::render_svg(&d, (max as i32).min(1024)))
+        {
+            pv.image = Some(img);
+            return pv;
+        }
+    }
+    if e.mime == "application/pdf" && crate::archive::have("pdftoppm") {
+        let prefix = tmp.with_extension("");
+        let ok = std::process::Command::new("pdftoppm")
+            .args([
+                "-png",
+                "-f",
+                "1",
+                "-l",
+                "1",
+                "-singlefile",
+                "-scale-to",
+                &max.to_string(),
+            ])
+            .arg(&e.path)
+            .arg(&prefix)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .is_ok_and(|s| s.success());
+        if ok {
+            pv.image = std::fs::read(&tmp)
+                .ok()
+                .and_then(|d| crate::icons::decode_png(&d));
+            let _ = std::fs::remove_file(&tmp);
+            if pv.image.is_some() {
+                return pv;
+            }
+        }
+    }
+    if types.contains_key(&e.mime) {
+        // The system thumbnailer at full preview size; not cached.
+        let th = crate::thumbs::thumbnailer_for(&e.mime);
+        if let Some(exec) = th {
+            if crate::thumbs::run_thumbnailer(
+                &exec,
+                &e.path,
+                &crate::x::file_uri(&e.path),
+                &tmp,
+                max,
+            ) {
+                pv.image = std::fs::read(&tmp)
+                    .ok()
+                    .and_then(|d| crate::icons::decode_png(&d));
+                let _ = std::fs::remove_file(&tmp);
+                if pv.image.is_some() {
+                    return pv;
+                }
+            }
+        }
+    }
+    if e.mime == "application/pdf" {
+        pv.note = Some("PDF PREVIEW NEEDS POPPLER-UTILS".into());
+        return pv;
+    }
+    // Text: the start of the file, when it has no NUL bytes.
+    let texty = e.mime.starts_with("text/")
+        || [
+            "json",
+            "xml",
+            "javascript",
+            "x-shellscript",
+            "toml",
+            "yaml",
+            "x-desktop",
+            "sql",
+        ]
+        .iter()
+        .any(|k| e.mime.contains(k))
+        || e.size < 64 * 1024;
+    if texty {
+        if let Ok(mut f) = std::fs::File::open(&e.path) {
+            use std::io::Read;
+            let mut buf = vec![0u8; 16 * 1024];
+            let n = f.read(&mut buf).unwrap_or(0);
+            buf.truncate(n);
+            if !buf.contains(&0) {
+                pv.lines = String::from_utf8_lossy(&buf)
+                    .lines()
+                    .take(200)
+                    .map(str::to_string)
+                    .collect();
+                if pv.lines.is_empty() {
+                    pv.note = Some("EMPTY FILE".into());
+                }
+                return pv;
+            }
+        }
+    }
+    pv
+}
+
+/// Icon sizes of the zoom steps (Ctrl+wheel, Ctrl+plus/minus).
+const ZOOM: [f32; 6] = [32.0, 48.0, 64.0, 96.0, 128.0, 192.0];
+const ZOOM_DEFAULT: usize = 2;
+
+fn metrics(text: &Text, font_px: f32, s: f32, zoom: usize) -> Metrics {
     let font = text.size(font_px);
     let small = text.size((font_px * 0.86).round());
     let pad = (8.0 * s).round() as i32;
-    let icon = if s >= 1.6 {
-        96
-    } else if s >= 1.2 {
-        64
-    } else {
-        48
-    };
-    let small_icon = if s >= 1.6 {
-        32
-    } else if s >= 1.2 {
-        24
-    } else {
-        22
-    };
+    let icon = (ZOOM[zoom.min(ZOOM.len() - 1)] * s).round() as i32;
+    let small_icon = ((22.0 * s).round() as i32).max(16);
     Metrics {
         s,
         font,
@@ -2439,7 +3010,7 @@ fn metrics(text: &Text, font_px: f32, s: f32) -> Metrics {
         side_w: (200.0 * s) as i32,
         icon,
         small_icon,
-        cell_w: (icon as f32 * 2.4).round() as i32,
+        cell_w: ((icon as f32 * 1.45).round() as i32).max((112.0 * s) as i32),
         cell_h: icon + 2 * font.height + 2 * pad + pad / 2,
         row_h: font.height.max(small_icon) + pad,
     }

@@ -42,6 +42,12 @@ pub enum Job {
         paths: Vec<PathBuf>,
         out: PathBuf,
     },
+    Mount {
+        dev: String,
+    },
+    Eject {
+        dev: String,
+    },
 }
 
 impl Job {
@@ -54,6 +60,8 @@ impl Job {
             Job::Restore { .. } => "Restoring",
             Job::Extract { .. } => "Unpacking",
             Job::Compress { .. } => "Packing",
+            Job::Mount { .. } => "Mounting",
+            Job::Eject { .. } => "Ejecting",
         }
     }
 }
@@ -80,6 +88,8 @@ pub enum Msg {
         undo: Option<Undo>,
         errors: Vec<String>,
         created: Vec<PathBuf>,
+        /// A folder to show when done (a drive that was just mounted).
+        open: Option<PathBuf>,
     },
 }
 
@@ -104,12 +114,19 @@ pub fn start(out: Sender<Msg>, wake: i32) -> Worker {
                 errors: Vec::new(),
                 last: std::time::Instant::now(),
             };
+            let mount = matches!(job, Job::Mount { .. });
             let (summary, undo, created) = run.job(job);
+            let open = if mount {
+                created.first().cloned()
+            } else {
+                None
+            };
             let _ = out.send(Msg::Done {
                 summary,
                 undo,
                 errors: run.errors,
                 created,
+                open,
             });
             poke(wake);
         }
@@ -291,6 +308,20 @@ impl Run<'_> {
                 Err(e) => {
                     self.fail(&archive, e);
                     ("Unpacking failed".into(), None, Vec::new())
+                }
+            },
+            Job::Mount { dev } => match crate::devices::mount(&dev) {
+                Ok(p) => (format!("Mounted {}", p.display()), None, vec![p]),
+                Err(e) => {
+                    self.fail(Path::new(&dev), e);
+                    ("Mounting failed".into(), None, Vec::new())
+                }
+            },
+            Job::Eject { dev } => match crate::devices::eject(&dev) {
+                Ok(()) => ("Safe to remove".into(), None, Vec::new()),
+                Err(e) => {
+                    self.fail(Path::new(&dev), e);
+                    ("Ejecting failed".into(), None, Vec::new())
                 }
             },
             Job::Compress { paths, out } => match crate::archive::compress(&paths, &out) {
