@@ -644,6 +644,16 @@ impl App {
     fn go(&mut self, path: PathBuf) {
         let path = std::fs::canonicalize(&path).unwrap_or(path);
         if path == self.tab().path {
+            // The same folder, but showing search results or Recent: show
+            // the folder itself again.
+            if self.tab().search.is_some() {
+                self.search_edit = None;
+                self.search_gen
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                self.searching = false;
+                let a = self.active;
+                self.load_tab(a, true);
+            }
             return;
         }
         let old = self.tab().path.clone();
