@@ -72,3 +72,44 @@ pub fn send(cmd: Command, path: &Path) -> Result<(), String> {
     std::thread::sleep(std::time::Duration::from_millis(150));
     Ok(())
 }
+
+/// Sync state of each path from the client: 1 synced, 2 syncing, 3 error,
+/// 0 unknown or ignored. Asked over one connection, answers read with a
+/// short deadline.
+pub fn statuses(paths: &[PathBuf]) -> Vec<(PathBuf, u8)> {
+    use std::io::{BufRead, BufReader};
+    let Ok(s) = std::os::unix::net::UnixStream::connect(socket()) else {
+        return Vec::new();
+    };
+    let _ = s.set_read_timeout(Some(std::time::Duration::from_millis(400)));
+    let mut w = &s;
+    for p in paths {
+        let q = p.to_string_lossy();
+        let _ =
+            w.write_all(format!("RETRIEVE_FILE_STATUS:{}\n", q.trim_end_matches('/')).as_bytes());
+    }
+    let _ = w.flush();
+    let mut out = Vec::new();
+    let reader = BufReader::new(&s);
+    for line in reader.lines() {
+        let Ok(line) = line else { break };
+        // STATUS:OK:/path, STATUS:SYNC:/path, STATUS:ERROR:/path, STATUS:OK+SWM:/path
+        let Some(rest) = line.strip_prefix("STATUS:") else {
+            continue;
+        };
+        let Some((st, path)) = rest.split_once(':') else {
+            continue;
+        };
+        let code = match st.split('+').next().unwrap_or("") {
+            "OK" => 1,
+            "SYNC" | "NEW" => 2,
+            "ERROR" | "WARNING" => 3,
+            _ => 0,
+        };
+        out.push((PathBuf::from(path), code));
+        if out.len() >= paths.len() {
+            break;
+        }
+    }
+    out
+}

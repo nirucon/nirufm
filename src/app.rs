@@ -194,6 +194,13 @@ pub struct App {
     search_edit: Option<String>,
     /// Two panes side by side: the tabs shown left and right.
     split: Option<(usize, usize)>,
+    share_hosts: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+    menu_hosts: Vec<String>,
+    help: bool,
+    job_started: Option<Instant>,
+    nc_status: std::collections::HashMap<PathBuf, u8>,
+    nc_tx: std::sync::mpsc::Sender<(PathBuf, u8)>,
+    nc_rx: std::sync::mpsc::Receiver<(PathBuf, u8)>,
     props: Option<Props>,
     search_due: Option<Instant>,
     search_gen: std::sync::Arc<std::sync::atomic::AtomicUsize>,
@@ -311,6 +318,8 @@ enum Act {
     NcBrowser,
     Props,
     OpenWith(u8),
+    Wallpaper,
+    SendTo(u8),
 }
 
 struct Menu {
@@ -350,6 +359,7 @@ impl App {
         let (preview_tx, preview_rx) = std::sync::mpsc::channel();
         let (gallery_tx, gallery_rx) = std::sync::mpsc::channel();
         let (search_tx, search_rx) = std::sync::mpsc::channel();
+        let (nc_tx, nc_rx) = std::sync::mpsc::channel();
         // A drive plugged in or pulled out shows up in /dev/disk/by-id;
         // a mount or unmount makes /proc/self/mounts readable with POLLPRI.
         let dev_watch = if inotify >= 0 {
@@ -450,6 +460,13 @@ impl App {
             gallery: None,
             search_edit: None,
             split: None,
+            share_hosts: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+            menu_hosts: Vec::new(),
+            help: false,
+            job_started: None,
+            nc_status: std::collections::HashMap::new(),
+            nc_tx,
+            nc_rx,
             props: None,
             search_due: None,
             search_gen: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
@@ -542,6 +559,9 @@ impl App {
         }
         if i == self.active {
             self.rewatch();
+            if reset {
+                self.nextcloud_status();
+            }
             let _ = self
                 .x
                 .set_title(&format!("{} · NIRUFM", places::pretty(&self.tabs[i].path)));
@@ -1347,6 +1367,11 @@ impl App {
         if self.gallery.is_some() {
             return self.gallery_key(sym, ctrl);
         }
+        if self.help && sym != 0xffbe {
+            self.help = false;
+            self.dirty = true;
+            return;
+        }
         if self.props.is_some() {
             match sym {
                 0x73 => self.props_checksum(), // s
@@ -1430,6 +1455,11 @@ impl App {
             }
             0xffbf => self.act(Act::Rename), // F2
             0xffc0 => self.toggle_split(),   // F3
+            0xffbe => {
+                // F1: the keys
+                self.help = !self.help;
+                self.dirty = true;
+            }
             0xff09 if !ctrl && self.split.is_some() => {
                 if let Some((other, _)) = self.other_pane() {
                     self.focus_pane(other);
@@ -1826,6 +1856,7 @@ impl App {
         }
         self.draw_preview();
         self.draw_props();
+        self.draw_help();
         self.draw_confirm();
         self.draw_connect();
     }
@@ -2288,6 +2319,12 @@ impl App {
                 let iy = r.y + pad + (icon - img.h) / 2;
                 self.cv.image(r.x + (r.w - img.w) / 2, iy, &img, alpha);
             }
+            let u = (2.0 * self.m.s).max(2.0) as i32;
+            self.draw_nc_badge(
+                &e.path,
+                r.x + (r.w + icon) / 2 - 5 * u,
+                r.y + pad + icon - 6 * u,
+            );
             let max_lines = if self.view == View::Thumbs { 1 } else { 2 };
             let lines = self.text.wrap(&e.label, font, cell_w - pad, max_lines);
             let mut ty = r.y + pad + icon + pad / 2;
@@ -2370,6 +2407,7 @@ impl App {
                     if e.hidden() { 150 } else { 255 },
                 );
             }
+            self.draw_nc_badge(&e.path, c.x + pad + si - 4, r.y + row_h / 2);
             let tx = c.x + pad * 2 + si;
             let name = self.text.ellipsize(&e.label, font, name_w - si - 2 * pad);
             self.text.draw(
@@ -2541,6 +2579,21 @@ impl App {
             let s = format!("find: {}", self.typed);
             self.text
                 .draw(&mut self.cv, r.x + pad, ty, &s, small, p.accent);
+        } else if let Some(e) = self.hover.and_then(|h| self.tab().entry(h).cloned()) {
+            // The item under the pointer, with its whole name.
+            let info = if e.is_dir {
+                format!("{} · folder", e.label)
+            } else {
+                format!(
+                    "{} · {} · {}",
+                    e.label,
+                    dir::human_size(e.size),
+                    dir::human_time(e.mtime)
+                )
+            };
+            let info = self.text.ellipsize(&info, small, r.w * 3 / 4);
+            self.text
+                .draw(&mut self.cv, r.x + pad, ty, &info, small, p.foreground);
         } else {
             self.text
                 .draw(&mut self.cv, r.x + pad, ty, &left, small, p.muted);
@@ -2553,7 +2606,7 @@ impl App {
             ty,
             right,
             small,
-            p.border,
+            blend(p.border, p.muted, 0.5),
         );
     }
 }
@@ -2583,6 +2636,9 @@ impl App {
     }
 
     fn submit(&mut self, job: crate::ops::Job) {
+        if self.running.is_none() {
+            self.job_started = Some(Instant::now());
+        }
         let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         if self.running.is_none() {
             self.running = Some(Running {
@@ -2616,6 +2672,10 @@ impl App {
                 .image
                 .map(|img| std::rc::Rc::new(crate::icons::scale_to_fit(&img, b, b)));
             self.thumb_img.insert(d.path, fitted);
+            self.dirty = true;
+        }
+        while let Ok((path, st)) = self.nc_rx.try_recv() {
+            self.nc_status.insert(path, st);
             self.dirty = true;
         }
         while let Ok((gen, found, done)) = self.search_rx.try_recv() {
@@ -2696,6 +2756,19 @@ impl App {
                         self.go(dir);
                     } else if summary == "Safe to remove" {
                         self.refresh_places();
+                    }
+                    // A long job ends with the NIRUX sound, unless Do not disturb is on.
+                    if self.pending == 0
+                        && self
+                            .job_started
+                            .take()
+                            .is_some_and(|t| t.elapsed() > Duration::from_secs(5))
+                    {
+                        play_sound(if errors.is_empty() {
+                            "timer-done"
+                        } else {
+                            "dictation-error"
+                        });
                     }
                     if let Some(first) = errors.first() {
                         let more = if errors.len() > 1 {
@@ -2920,6 +2993,38 @@ impl App {
             }
             Act::Connect => self.open_connect(None, None),
             Act::Props => self.open_props(),
+            Act::Wallpaper => {
+                if let Some(p) = sel.first() {
+                    spawn(
+                        "niructl",
+                        &[
+                            std::ffi::OsStr::new("wallpaper"),
+                            std::ffi::OsStr::new("set"),
+                            p.as_os_str(),
+                        ],
+                        None,
+                    );
+                    self.flash("Set as wallpaper".into());
+                }
+            }
+            Act::SendTo(k) => {
+                if let Some(host) = self.menu_hosts.get(k as usize).cloned() {
+                    for p in sel.iter().filter(|p| p.is_file()) {
+                        spawn(
+                            "nirushare",
+                            &[
+                                std::ffi::OsStr::new("send"),
+                                std::ffi::OsStr::new("--to"),
+                                std::ffi::OsStr::new(&host),
+                                std::ffi::OsStr::new("--file"),
+                                p.as_os_str(),
+                            ],
+                            None,
+                        );
+                    }
+                    self.flash(format!("Sending to {host}"));
+                }
+            }
             Act::OpenWith(k) => {
                 if let Some(app) = self.menu_apps.get(k as usize).cloned() {
                     crate::apps::launch(&app, &sel, &here);
@@ -3143,6 +3248,21 @@ impl App {
                 items.push(("Pack as .tar.gz".into(), Act::PackTar, ""));
                 items.push(("Move to the trash".into(), Act::Trash, "Del"));
                 items.push(("Delete permanently".into(), Act::Delete, "Shift+Del"));
+                if sel.len() == 1 && mimes_image(&self.mime, &sel[0]) {
+                    items.push(("Set as wallpaper".into(), Act::Wallpaper, "W in gallery"));
+                }
+                self.menu_hosts = self
+                    .share_hosts
+                    .lock()
+                    .map(|h| h.clone())
+                    .unwrap_or_default();
+                self.menu_hosts.truncate(4);
+                if sel.iter().all(|p| p.is_file()) {
+                    for (k, h) in self.menu_hosts.iter().enumerate() {
+                        items.push((format!("Send to {h}"), Act::SendTo(k as u8), "NIRUSHARE"));
+                    }
+                }
+                self.refresh_share_hosts();
                 items.push(("Properties".into(), Act::Props, "Alt+Enter"));
             }
         } else {
@@ -5283,6 +5403,233 @@ fn group_name(gid: u32) -> String {
     unsafe { std::ffi::CStr::from_ptr((*gr).gr_name) }
         .to_string_lossy()
         .into_owned()
+}
+
+impl App {
+    /// Online NIRUSHARE devices, asked for in the background.
+    fn refresh_share_hosts(&self) {
+        if !crate::archive::have("nirushare") {
+            return;
+        }
+        let hosts = self.share_hosts.clone();
+        std::thread::spawn(move || {
+            let Ok(out) = std::process::Command::new("nirushare")
+                .arg("devices")
+                .stderr(std::process::Stdio::null())
+                .output()
+            else {
+                return;
+            };
+            let text = String::from_utf8_lossy(&out.stdout);
+            // A JSON list of {"host": "...", "online": true}; read without a parser.
+            let mut v = Vec::new();
+            for obj in text.split('}') {
+                let host = obj
+                    .split("\"host\"")
+                    .nth(1)
+                    .and_then(|r| r.split('"').nth(1))
+                    .map(str::to_string);
+                let online = obj.contains("\"online\": true") || obj.contains("\"online\":true");
+                if let (Some(h), true) = (host, online) {
+                    v.push(h);
+                }
+            }
+            if let Ok(mut g) = hosts.lock() {
+                *g = v;
+            }
+        });
+    }
+
+    /// Ask the Nextcloud client how each shown item is synced.
+    fn nextcloud_status(&mut self) {
+        self.nc_status.clear();
+        let dir = self.tab().path.clone();
+        if !crate::nextcloud::in_sync_folder(&dir) {
+            return;
+        }
+        let paths: Vec<PathBuf> = self
+            .tab()
+            .shown
+            .iter()
+            .take(400)
+            .map(|k| self.tab().all[*k].path.clone())
+            .collect();
+        let (tx, wake) = (self.nc_tx.clone(), self.wake);
+        std::thread::spawn(move || {
+            for (p, st) in crate::nextcloud::statuses(&paths) {
+                let _ = tx.send((p, st));
+            }
+            crate::ops::poke(wake);
+        });
+    }
+
+    /// A small pixel badge on an item: synced, syncing or error.
+    fn draw_nc_badge(&mut self, path: &Path, x: i32, y: i32) {
+        let Some(st) = self.nc_status.get(path).copied() else {
+            return;
+        };
+        let u = (2.0 * self.m.s).max(2.0) as i32;
+        let (col, glyph): (u32, &[u8]) = match st {
+            1 => (0x6fbf73, &[0b000, 0b001, 0b010, 0b100, 0b000]),
+            2 => (0x6fa8dc, &[0b010, 0b111, 0b010, 0b010, 0b010]),
+            3 => (0xd77a7a, &[0b101, 0b010, 0b101, 0b000, 0b000]),
+            _ => return,
+        };
+        let r = Rect::new(x, y, 5 * u, 6 * u);
+        self.cv.fill(r, self.p.background);
+        self.cv.frame(r, col);
+        for (row, bits) in glyph.iter().enumerate() {
+            for c in 0..3 {
+                if bits & (4 >> c) != 0 {
+                    self.cv.fill(
+                        Rect::new(x + u + c * u, y + u / 2 + row as i32 * u, u, u),
+                        col,
+                    );
+                }
+            }
+        }
+    }
+
+    fn draw_help(&mut self) {
+        if !self.help {
+            return;
+        }
+        let p = self.p;
+        let (font, small, pad) = (self.m.font, self.m.small, self.m.pad);
+        let groups: [(&str, &[(&str, &str)]); 4] = [
+            (
+                "BROWSE",
+                &[
+                    ("Enter", "open"),
+                    ("Backspace", "parent folder"),
+                    ("Alt+Left/Right", "back, forward"),
+                    ("Ctrl+L", "type a path"),
+                    ("Ctrl+F", "search below"),
+                    ("letters", "jump to a name"),
+                    ("Ctrl+H", "hidden files"),
+                    ("Ctrl+1-4", "icons, thumbnails, compact, list"),
+                    ("Ctrl+wheel, Ctrl +/-", "zoom"),
+                    ("Space", "preview"),
+                    ("Ctrl+G", "gallery"),
+                ],
+            ),
+            (
+                "FILES",
+                &[
+                    ("Ctrl+C, Ctrl+X, Ctrl+V", "copy, cut, paste"),
+                    ("Ctrl+Shift+C", "copy the path"),
+                    ("Delete", "to the trash"),
+                    ("Shift+Delete", "delete for good"),
+                    ("Ctrl+Z", "undo"),
+                    ("F2", "rename"),
+                    ("Ctrl+Shift+N", "new folder"),
+                    ("Alt+Enter", "properties"),
+                    ("right-click", "menu: open with, pack, links"),
+                ],
+            ),
+            (
+                "WINDOW",
+                &[
+                    ("Ctrl+T, Ctrl+W", "new tab, close tab"),
+                    ("Ctrl+Tab", "next tab"),
+                    ("F3", "two panes"),
+                    ("Tab", "other pane"),
+                    ("F4", "terminal here"),
+                    ("F5", "reload"),
+                    ("Ctrl+D", "bookmark"),
+                    ("Ctrl+K", "connect to a server"),
+                    ("Ctrl+Q", "quit"),
+                ],
+            ),
+            (
+                "GALLERY",
+                &[
+                    ("Left, Right", "browse"),
+                    ("Space", "slideshow"),
+                    ("F", "full screen"),
+                    ("+, -, 0", "zoom"),
+                    ("R", "turn"),
+                    ("I", "info"),
+                    ("W", "wallpaper"),
+                    ("Delete", "trash"),
+                    ("Esc", "back"),
+                ],
+            ),
+        ];
+        let col_w = (self.cv.w - 6 * pad) / 2;
+        let row = small.height + pad / 3;
+        let rows_l = groups[0].1.len() + groups[1].1.len() + 2;
+        let rows_r = groups[2].1.len() + groups[3].1.len() + 2;
+        let h = (rows_l.max(rows_r) as i32) * row + 4 * pad + 2 * font.height + 2 * pad;
+        let w = self.cv.w - 4 * pad;
+        let r = Rect::new(2 * pad, (self.cv.h - h).max(0) / 2, w, h.min(self.cv.h));
+        self.cv
+            .tint(Rect::new(0, 0, self.cv.w, self.cv.h), p.background, 170);
+        self.cv.fill(r, p.surface);
+        self.cv.frame(r, p.accent);
+        let lp = (2.0 * self.m.s).round().max(2.0) as i32;
+        crate::logo::word(
+            &mut self.cv,
+            r.x + 2 * pad,
+            r.y + 2 * pad,
+            "NIRUFM KEYS",
+            lp,
+            p.accent,
+            None,
+        );
+        let key_w = (170.0 * self.m.s) as i32;
+        for (half, list) in [(0, [0usize, 1]), (1, [2, 3])] {
+            let mut y = r.y + 3 * pad + 7 * lp;
+            let x = r.x + 2 * pad + half * (col_w + pad);
+            for gi in list {
+                let (title, keys) = groups[gi];
+                self.text.draw(&mut self.cv, x, y, title, small, p.accent);
+                y += row;
+                for (k, d) in keys.iter() {
+                    let kk = self.text.ellipsize(k, small, key_w - pad);
+                    self.text.draw(&mut self.cv, x, y, &kk, small, p.foreground);
+                    self.text
+                        .draw(&mut self.cv, x + key_w, y, d, small, p.muted);
+                    y += row;
+                }
+                y += row / 2;
+            }
+        }
+    }
+}
+
+fn mimes_image(mime: &Mime, p: &Path) -> bool {
+    let n = p
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    mime.for_name(&n).starts_with("image/")
+}
+
+/// A NIRUX event sound, quiet under Do not disturb.
+fn play_sound(event: &'static str) {
+    std::thread::spawn(move || {
+        let dnd = std::process::Command::new("niructl")
+            .args(["dnd", "status"])
+            .output()
+            .map(|o| String::from_utf8_lossy(&o.stdout).contains(" on"))
+            .unwrap_or(false);
+        if dnd {
+            return;
+        }
+        let data = std::env::var_os("XDG_DATA_HOME")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| theme::home().join(".local/share"));
+        let f = data.join("nirux/sounds").join(format!("{event}.ogg"));
+        if f.is_file() {
+            let _ = std::process::Command::new("pw-play")
+                .arg(&f)
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status();
+        }
+    });
 }
 
 /// Icon sizes of the zoom steps (Ctrl+wheel, Ctrl+plus/minus).
