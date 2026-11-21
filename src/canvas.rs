@@ -179,6 +179,41 @@ impl Canvas {
         }
     }
 
+    /// Draw `img` stretched into `dst` (which may reach outside the canvas)
+    /// with nearest sampling: used for zooming in on a photo.
+    pub fn image_scaled(&mut self, img: &Image, dst: Rect) {
+        if dst.w <= 0 || dst.h <= 0 || img.w <= 0 || img.h <= 0 {
+            return;
+        }
+        let area = dst.intersect(&self.clip);
+        for py in area.y..area.y + area.h {
+            let sy = (((py - dst.y) as i64 * img.h as i64) / dst.h as i64)
+                .clamp(0, img.h as i64 - 1) as usize;
+            let row = (py * self.w) as usize;
+            for px in area.x..area.x + area.w {
+                let sx = (((px - dst.x) as i64 * img.w as i64) / dst.w as i64)
+                    .clamp(0, img.w as i64 - 1) as usize;
+                let s = (sy * img.w as usize + sx) * 4;
+                let (r, g, b, a) = (
+                    img.data[s] as u32,
+                    img.data[s + 1] as u32,
+                    img.data[s + 2] as u32,
+                    img.data[s + 3] as u32,
+                );
+                if a == 0 {
+                    continue;
+                }
+                let i = row + px as usize;
+                let d = self.px[i];
+                let inv = 255 - a;
+                let ch = |s: u32, d: u32| (s + (d * inv + 127) / 255).min(255);
+                self.px[i] = (ch(r, (d >> 16) & 0xff) << 16)
+                    | (ch(g, (d >> 8) & 0xff) << 8)
+                    | ch(b, d & 0xff);
+            }
+        }
+    }
+
     pub fn as_bytes(&self) -> &[u8] {
         // SAFETY: u32 has no padding; the slice covers exactly the pixels.
         unsafe { std::slice::from_raw_parts(self.px.as_ptr() as *const u8, self.px.len() * 4) }

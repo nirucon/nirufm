@@ -186,7 +186,30 @@ pub struct App {
     dropped_files: Option<Vec<PathBuf>>,
     /// Remembered view per folder: view, zoom, sort, reverse.
     folders: std::collections::HashMap<PathBuf, (View, usize, SortKey, bool)>,
+    gallery: Option<Gallery>,
+    gallery_tx: std::sync::mpsc::Sender<(PathBuf, Option<crate::canvas::Image>)>,
+    gallery_rx: std::sync::mpsc::Receiver<(PathBuf, Option<crate::canvas::Image>)>,
 }
+
+/// The photo and film viewer.
+struct Gallery {
+    items: Vec<Entry>,
+    pos: usize,
+    images: std::collections::HashMap<PathBuf, Option<std::rc::Rc<crate::canvas::Image>>>,
+    fitted: Option<(PathBuf, u8, i32, i32, std::rc::Rc<crate::canvas::Image>)>,
+    strip: std::collections::HashMap<PathBuf, Option<std::rc::Rc<crate::canvas::Image>>>,
+    exif: std::collections::HashMap<PathBuf, Option<crate::exif::Exif>>,
+    slideshow: Option<Instant>,
+    zoom: f32,
+    pan: (i32, i32),
+    rot: u8,
+    info: bool,
+    full: bool,
+    grab: Option<(i32, i32, i32, i32)>,
+    last_click: Option<Instant>,
+}
+
+const SLIDE: Duration = Duration::from_secs(4);
 
 /// Files being dragged out of this window.
 struct DragOut {
@@ -303,6 +326,7 @@ impl App {
         let worker = crate::ops::start(tx, wake);
         let (thumbs, thumb_types) = crate::thumbs::Thumbs::start(wake);
         let (preview_tx, preview_rx) = std::sync::mpsc::channel();
+        let (gallery_tx, gallery_rx) = std::sync::mpsc::channel();
         // A drive plugged in or pulled out shows up in /dev/disk/by-id;
         // a mount or unmount makes /proc/self/mounts readable with POLLPRI.
         let dev_watch = if inotify >= 0 {
@@ -400,6 +424,9 @@ impl App {
             drop_target: None,
             dropped_files: None,
             folders: load_folders(),
+            gallery: None,
+            gallery_tx,
+            gallery_rx,
         };
         app.load_tab(0, true);
         app.x.map()?;
@@ -629,6 +656,12 @@ impl App {
         let Some(e) = self.tab().entry(i).cloned() else {
             return;
         };
+        if e.mime.starts_with("image/") && e.mime != "image/svg+xml"
+            || e.mime == "image/svg+xml" && e.size < 4 << 20
+        {
+            self.open_gallery(Some(e.path.clone()));
+            return;
+        }
         if e.is_dir {
             self.go(e.path);
         } else {
@@ -836,6 +869,11 @@ impl App {
                     self.load_tab(a, false);
                 }
             }
+            if let Some(g) = &self.gallery {
+                if g.slideshow.is_some_and(|t| t.elapsed() >= SLIDE) {
+                    self.gallery_step(1, true);
+                }
+            }
             if self
                 .message
                 .as_ref()
@@ -863,6 +901,10 @@ impl App {
             let mut timeout: i32 = -1;
             if let Some(at) = self.reload_at {
                 timeout = at.saturating_duration_since(Instant::now()).as_millis() as i32 + 1;
+            }
+            if let Some(t) = self.gallery.as_ref().and_then(|g| g.slideshow) {
+                let left = SLIDE.saturating_sub(t.elapsed()).as_millis() as i32 + 1;
+                timeout = if timeout < 0 { left } else { timeout.min(left) };
             }
             if let Some((_, t)) = &self.message {
                 let left = Duration::from_secs(3)
@@ -960,6 +1002,19 @@ impl App {
                 self.drop_data(e.property)
             }
             Event::SelectionNotify(e) => self.pasted(e.target, e.property),
+            Event::ButtonRelease(_) if self.gallery.is_some() => {
+                if let Some(g) = self.gallery.as_mut() {
+                    g.grab = None;
+                }
+            }
+            Event::MotionNotify(e) if self.gallery.as_ref().is_some_and(|g| g.grab.is_some()) => {
+                if let Some(g) = self.gallery.as_mut() {
+                    if let Some((sx, sy, px, py)) = g.grab {
+                        g.pan = (px + e.event_x as i32 - sx, py + e.event_y as i32 - sy);
+                        self.dirty = true;
+                    }
+                }
+            }
             Event::ButtonRelease(e) if e.detail == 1 => self.release(
                 e.event_x as i32,
                 e.event_y as i32,
@@ -1027,6 +1082,9 @@ impl App {
     fn button(&mut self, b: u8, x: i32, y: i32, state: KeyButMask) {
         let ctrl = state.contains(KeyButMask::CONTROL);
         let shift = state.contains(KeyButMask::SHIFT);
+        if self.gallery.is_some() {
+            return self.gallery_button(b, x, y);
+        }
         if self.confirm.is_some() {
             return;
         }
@@ -1224,6 +1282,9 @@ impl App {
         let ctrl = state.contains(KeyButMask::CONTROL);
         let shift = state.contains(KeyButMask::SHIFT);
         let alt = state.contains(KeyButMask::MOD1);
+        if self.gallery.is_some() {
+            return self.gallery_key(sym, ctrl);
+        }
         if self.connect.is_some() {
             return self.connect_key(sym, ctrl, shift);
         }
@@ -1386,6 +1447,7 @@ impl App {
             0x76 => self.act(Act::Paste),          // v
             0x7a => self.undo_last(),              // z
             0x6b => self.act(Act::Connect),        // k
+            0x67 => self.open_gallery(None),       // g
             0x64 => self.act(Act::Bookmark),       // d
             0x68 => {
                 // h
@@ -1578,6 +1640,10 @@ impl App {
         self.draw_rename();
         self.draw_menu();
         self.draw_drop_target();
+        if self.gallery.is_some() {
+            self.draw_gallery();
+            return;
+        }
         self.draw_preview();
         self.draw_confirm();
         self.draw_connect();
@@ -2311,12 +2377,29 @@ impl App {
 
     fn worker_messages(&mut self) {
         while let Ok(d) = self.thumbs.rx.try_recv() {
+            if let Some(g) = self.gallery.as_mut() {
+                if g.strip.contains_key(&d.path) {
+                    let b = (64.0 * self.m.s) as i32;
+                    let img = d
+                        .image
+                        .as_ref()
+                        .map(|i| std::rc::Rc::new(crate::icons::scale_to_fit(i, b * 3 / 2, b)));
+                    g.strip.insert(d.path.clone(), img);
+                    self.dirty = true;
+                }
+            }
             let b = self.picture_size().max(16);
             let fitted = d
                 .image
                 .map(|img| std::rc::Rc::new(crate::icons::scale_to_fit(&img, b, b)));
             self.thumb_img.insert(d.path, fitted);
             self.dirty = true;
+        }
+        while let Ok((path, img)) = self.gallery_rx.try_recv() {
+            if let Some(g) = self.gallery.as_mut() {
+                g.images.insert(path, img.map(std::rc::Rc::new));
+                self.dirty = true;
+            }
         }
         while let Ok(pv) = self.preview_rx.try_recv() {
             if self.preview.as_ref().is_some_and(|cur| cur.path == pv.path) {
@@ -4071,6 +4154,500 @@ fn view_glyph(cv: &mut Canvas, r: Rect, v: View, col: u32) {
                 cv.fill(Rect::new(r.x, y, 2, 2), col);
                 cv.fill(Rect::new(r.x + 3, y, w - 3, 2), col);
             }
+        }
+    }
+}
+
+impl App {
+    /// Open the gallery on the photos and films of the folder, at `start`
+    /// (or the cursor, or the first one).
+    fn open_gallery(&mut self, start: Option<PathBuf>) {
+        let t = self.tab();
+        let items: Vec<Entry> = t
+            .shown
+            .iter()
+            .map(|k| t.all[*k].clone())
+            .filter(|e| !e.is_dir && (e.mime.starts_with("image/") || e.mime.starts_with("video/")))
+            .collect();
+        if items.is_empty() {
+            self.flash("No photos or films here".into());
+            return;
+        }
+        let want = start.or_else(|| t.entry(t.cursor).map(|e| e.path.clone()));
+        let pos = want
+            .and_then(|w| items.iter().position(|e| e.path == w))
+            .unwrap_or(0);
+        let strip = items.iter().map(|e| (e.path.clone(), None)).collect();
+        self.gallery = Some(Gallery {
+            items,
+            pos,
+            images: std::collections::HashMap::new(),
+            fitted: None,
+            strip,
+            exif: std::collections::HashMap::new(),
+            slideshow: None,
+            zoom: 1.0,
+            pan: (0, 0),
+            rot: 0,
+            info: false,
+            full: false,
+            grab: None,
+            last_click: None,
+        });
+        self.gallery_load();
+        self.dirty = true;
+    }
+
+    fn close_gallery(&mut self) {
+        if let Some(g) = self.gallery.take() {
+            if g.full {
+                self.x.toggle_fullscreen(false);
+            }
+            // The browser shows where the gallery ended.
+            let here = g.items[g.pos].path.clone();
+            if let Some(k) = self
+                .tab()
+                .shown
+                .iter()
+                .position(|k| self.tab().all[*k].path == here)
+            {
+                self.set_cursor(k, false, false);
+            }
+        }
+        self.dirty = true;
+    }
+
+    /// Load the current photo and its neighbours; forget the far ones.
+    fn gallery_load(&mut self) {
+        let max = (self.cv.w.max(self.cv.h) as u32).clamp(800, 2560);
+        let types = self.thumb_types.clone();
+        let Some(g) = self.gallery.as_mut() else {
+            return;
+        };
+        let n = g.items.len();
+        let near: Vec<usize> = [0isize, 1, -1, 2]
+            .iter()
+            .map(|d| ((g.pos as isize + d).rem_euclid(n as isize)) as usize)
+            .collect();
+        let keep: Vec<PathBuf> = near.iter().map(|i| g.items[*i].path.clone()).collect();
+        g.images.retain(|p, _| keep.contains(p));
+        for i in near {
+            let e = g.items[i].clone();
+            if g.images.contains_key(&e.path) {
+                continue;
+            }
+            g.images.insert(e.path.clone(), None);
+            let tx = self.gallery_tx.clone();
+            let wake = self.wake;
+            let types = types.clone();
+            std::thread::spawn(move || {
+                let pv = make_preview(&e, &types, max);
+                let _ = tx.send((e.path.clone(), pv.image));
+                crate::ops::poke(wake);
+            });
+        }
+        // Thumbnails for the film strip around the current photo.
+        let lo = g.pos.saturating_sub(12);
+        let hi = (g.pos + 13).min(n);
+        let want: Vec<Entry> = g.items[lo..hi].to_vec();
+        for e in want {
+            let missing = g.strip.get(&e.path).is_some_and(|v| v.is_none());
+            if missing && crate::thumbs::wanted(&e.mime, &self.thumb_types) {
+                self.thumbs.request(crate::thumbs::Request {
+                    path: e.path.clone(),
+                    mime: e.mime.clone(),
+                    mtime: e.mtime,
+                    size: 128,
+                });
+            }
+        }
+        let cur = g.items[g.pos].path.clone();
+        if !g.exif.contains_key(&cur) {
+            g.exif.insert(cur.clone(), crate::exif::read(&cur));
+        }
+    }
+
+    fn gallery_step(&mut self, d: isize, slideshow: bool) {
+        let Some(g) = self.gallery.as_mut() else {
+            return;
+        };
+        let n = g.items.len() as isize;
+        g.pos = ((g.pos as isize + d).rem_euclid(n)) as usize;
+        g.zoom = 1.0;
+        g.pan = (0, 0);
+        g.rot = 0;
+        if slideshow {
+            g.slideshow = Some(Instant::now());
+        }
+        self.gallery_load();
+        self.dirty = true;
+    }
+
+    fn gallery_key(&mut self, sym: u32, ctrl: bool) {
+        let Some(g) = self.gallery.as_mut() else {
+            return;
+        };
+        let cur = g.items[g.pos].clone();
+        match sym {
+            0xff1b => {
+                if g.full {
+                    g.full = false;
+                    self.x.toggle_fullscreen(false);
+                } else {
+                    self.close_gallery();
+                }
+            }
+            0x71 => self.close_gallery(), // q
+            0xff53 | 0xff56 | 0xff54 | 0x6c => self.gallery_step(1, false),
+            0xff51 | 0xff55 | 0xff52 | 0x68 | 0xff08 => self.gallery_step(-1, false),
+            0xff50 => {
+                let p = g.pos as isize;
+                self.gallery_step(-p, false)
+            }
+            0xff57 => {
+                let d = g.items.len() as isize - 1 - g.pos as isize;
+                self.gallery_step(d, false)
+            }
+            0x20 => {
+                g.slideshow = if g.slideshow.is_some() {
+                    None
+                } else {
+                    Some(Instant::now())
+                };
+                let on = g.slideshow.is_some();
+                self.flash(if on {
+                    "Slideshow".into()
+                } else {
+                    "Slideshow stopped".into()
+                });
+            }
+            0x66 | 0xffc8 => {
+                // f, F11
+                g.full = !g.full;
+                let on = g.full;
+                self.x.toggle_fullscreen(on);
+            }
+            0x2b | 0x3d | 0xffab => g.zoom = (g.zoom * 1.25).min(16.0),
+            0x2d | 0xffad => g.zoom = (g.zoom / 1.25).max(1.0),
+            0x30 => {
+                g.zoom = 1.0;
+                g.pan = (0, 0);
+            }
+            0x31 => g.zoom = 100.0, // 1: actual pixels (clamped when drawn)
+            0x72 => g.rot = (g.rot + 1) % 4, // r
+            0x52 => g.rot = (g.rot + 3) % 4, // R
+            0x69 => g.info = !g.info, // i
+            0xff0d | 0xff8d => {
+                spawn("xdg-open", &[cur.path.as_os_str()], None);
+                self.flash(format!("Opening {}", cur.label));
+            }
+            0x77 => {
+                // w: wallpaper through NIRUWM.
+                spawn(
+                    "niructl",
+                    &[
+                        std::ffi::OsStr::new("wallpaper"),
+                        std::ffi::OsStr::new("set"),
+                        cur.path.as_os_str(),
+                    ],
+                    None,
+                );
+                self.flash(format!("Wallpaper: {}", cur.label));
+            }
+            0x63 if ctrl => {
+                self.clip = Some((vec![cur.path.clone()], false));
+                let _ = self.x.own_clipboard();
+                self.flash(format!("Copied {}", cur.label));
+            }
+            0xffff => {
+                // Delete: to the trash, and on to the next one.
+                self.submit(crate::ops::Job::Trash {
+                    paths: vec![cur.path.clone()],
+                });
+                let g = self.gallery.as_mut().unwrap();
+                g.items.remove(g.pos);
+                g.images.remove(&cur.path);
+                if g.items.is_empty() {
+                    self.gallery = None;
+                } else {
+                    if g.pos >= g.items.len() {
+                        g.pos = 0;
+                    }
+                    self.gallery_load();
+                }
+            }
+            _ => {}
+        }
+        self.dirty = true;
+    }
+
+    fn gallery_button(&mut self, b: u8, x: i32, y: i32) {
+        match b {
+            4 => return self.gallery_step(-1, false),
+            5 => return self.gallery_step(1, false),
+            8 => return self.gallery_step(-1, false),
+            9 => return self.gallery_step(1, false),
+            3 => return self.close_gallery(),
+            _ => {}
+        }
+        if b != 1 {
+            return;
+        }
+        if let Some(Hit::Item(i)) = self.hit(x, y) {
+            // A film strip picture.
+            let Some(g) = self.gallery.as_ref() else {
+                return;
+            };
+            let d = i as isize - g.pos as isize;
+            return self.gallery_step(d, false);
+        }
+        let Some(g) = self.gallery.as_mut() else {
+            return;
+        };
+        let double = g.last_click.is_some_and(|t| t.elapsed() < DOUBLE_CLICK);
+        g.last_click = Some(Instant::now());
+        if double {
+            g.full = !g.full;
+            let on = g.full;
+            self.x.toggle_fullscreen(on);
+        } else {
+            g.grab = Some((x, y, g.pan.0, g.pan.1));
+        }
+        self.dirty = true;
+    }
+
+    fn draw_gallery(&mut self) {
+        let p = self.p;
+        let (font, small, pad) = (self.m.font, self.m.small, self.m.pad);
+        let (w, h) = (self.cv.w, self.cv.h);
+        self.hits.clear();
+        self.cv.reset_clip();
+        let dark = blend(p.background, 0x000000, 0.6);
+        self.cv.fill(Rect::new(0, 0, w, h), dark);
+        let full = self.gallery.as_ref().is_some_and(|g| g.full);
+        let strip_h = if full { 0 } else { (84.0 * self.m.s) as i32 };
+        let top_h = if full { 0 } else { font.height + 2 * pad };
+        let area = Rect::new(0, top_h, w, h - top_h - strip_h);
+        let g = self.gallery.as_mut().unwrap();
+        let cur = g.items[g.pos].clone();
+        let img = g.images.get(&cur.path).cloned().flatten();
+        let (zoom, pan, rot) = (g.zoom, g.pan, g.rot);
+        if let Some(full_img) = img {
+            // Rotated once per turn; the fitted copy is kept for redraws.
+            let (iw, ih) = if rot % 2 == 1 {
+                (full_img.h, full_img.w)
+            } else {
+                (full_img.w, full_img.h)
+            };
+            let fit = (area.w as f32 / iw as f32)
+                .min(area.h as f32 / ih as f32)
+                .min(1.0);
+            let scale = (fit * zoom).min(4.0f32.max(fit));
+            let dw = (iw as f32 * scale).round() as i32;
+            let dh = (ih as f32 * scale).round() as i32;
+            let dx = area.x + (area.w - dw) / 2 + pan.0;
+            let dy = area.y + (area.h - dh) / 2 + pan.1;
+            self.cv.set_clip(area);
+            if zoom <= 1.0 {
+                let key_ok = g.fitted.as_ref().is_some_and(|(pp, r, fw, fh, _)| {
+                    pp == &cur.path && *r == rot && *fw == dw && *fh == dh
+                });
+                if !key_ok {
+                    let turned = crate::icons::rotate(&full_img, rot);
+                    let small_img = crate::icons::scale_to_fit(&turned, dw, dh);
+                    g.fitted = Some((cur.path.clone(), rot, dw, dh, std::rc::Rc::new(small_img)));
+                }
+                let f = g.fitted.as_ref().unwrap().4.clone();
+                self.cv
+                    .image(dx + (dw - f.w) / 2, dy + (dh - f.h) / 2, &f, 255);
+            } else {
+                let turned = if rot == 0 {
+                    full_img.clone()
+                } else {
+                    std::rc::Rc::new(crate::icons::rotate(&full_img, rot))
+                };
+                self.cv.image_scaled(&turned, Rect::new(dx, dy, dw, dh));
+            }
+            self.cv.reset_clip();
+            if cur.mime.starts_with("video/") {
+                // A big pixel play mark over a film.
+                let s = (area.h / 8).max(24);
+                let (cx, cy) = (area.x + area.w / 2, area.y + area.h / 2);
+                for k in 0..s {
+                    let half = (s - k) / 2;
+                    self.cv.tint(
+                        Rect::new(cx - s / 3 + k, cy - half, 1, 2 * half),
+                        0xffffff,
+                        200,
+                    );
+                }
+            }
+        } else {
+            let label = if g.images.get(&cur.path).is_some_and(|v| v.is_none()) {
+                "LOADING"
+            } else {
+                "NO PREVIEW"
+            };
+            let tw = crate::logo::word_width(label, 3);
+            crate::logo::word(
+                &mut self.cv,
+                area.x + (area.w - tw) / 2,
+                area.y + area.h / 2,
+                label,
+                3,
+                p.muted,
+                None,
+            );
+        }
+        let g = self.gallery.as_ref().unwrap();
+        let (pos, n, info, slideshow) = (g.pos, g.items.len(), g.info, g.slideshow.is_some());
+        let exif = g.exif.get(&cur.path).cloned().flatten();
+        if !full {
+            // Title row: name, position, zoom, keys.
+            self.cv.fill(Rect::new(0, 0, w, top_h), p.surface);
+            self.cv.fill(Rect::new(0, top_h - 1, w, 1), p.border);
+            let lp = (2.0 * self.m.s).round().max(2.0) as i32;
+            crate::logo::word(
+                &mut self.cv,
+                pad * 2,
+                (top_h - 7 * lp) / 2,
+                "GALLERY",
+                lp,
+                p.accent,
+                None,
+            );
+            let gx = pad * 3 + crate::logo::word_width("GALLERY", lp);
+            let mut title = format!("{}   {}/{}", cur.label, pos + 1, n);
+            if zoom > 1.0 {
+                title.push_str(&format!("   {:.0}%", zoom * 100.0));
+            }
+            if slideshow {
+                title.push_str("   ▶ slideshow");
+            }
+            let title = self.text.ellipsize(&title, font, w / 2);
+            self.text.draw(
+                &mut self.cv,
+                gx + pad,
+                (top_h - font.height) / 2,
+                &title,
+                font,
+                p.foreground,
+            );
+            let keys = "←→ browse · Space slideshow · F full · +/- zoom · R turn · I info · W wallpaper · Del trash · Esc back";
+            let keys = self.text.ellipsize(keys, small, w / 2 - 3 * pad);
+            let kw = self.text.width(&keys, small);
+            self.text.draw(
+                &mut self.cv,
+                w - kw - 2 * pad,
+                (top_h - small.height) / 2,
+                &keys,
+                small,
+                p.muted,
+            );
+            // Film strip.
+            let sy = h - strip_h;
+            self.cv.fill(Rect::new(0, sy, w, strip_h), p.surface);
+            self.cv.fill(Rect::new(0, sy, w, 1), p.border);
+            let th = strip_h - 2 * pad;
+            let tw = th * 3 / 2;
+            let step = tw + pad;
+            let visible = (w / step).max(1) as isize;
+            let first = (pos as isize - visible / 2)
+                .max(0)
+                .min((n as isize - visible).max(0)) as usize;
+            let items: Vec<Entry> = g.items[first..(first + visible as usize).min(n)].to_vec();
+            for (k, e) in items.iter().enumerate() {
+                let idx = first + k;
+                let r = Rect::new(pad + k as i32 * step, sy + pad, tw, th);
+                let thumb = self
+                    .gallery
+                    .as_ref()
+                    .unwrap()
+                    .strip
+                    .get(&e.path)
+                    .cloned()
+                    .flatten();
+                self.cv.fill(r, p.background);
+                if let Some(t) = thumb {
+                    self.cv.image(
+                        r.x + (r.w - t.w) / 2,
+                        r.y + (r.h - t.h) / 2,
+                        &t,
+                        if idx == pos { 255 } else { 170 },
+                    );
+                } else if let Some(icon) = self.icon_for(e, th / 2) {
+                    self.cv.image(
+                        r.x + (r.w - icon.w) / 2,
+                        r.y + (r.h - icon.h) / 2,
+                        &icon,
+                        200,
+                    );
+                }
+                if idx == pos {
+                    for d in 0..(2.0 * self.m.s).max(2.0) as i32 {
+                        self.cv.frame(r.inset(-d - 1), p.accent);
+                    }
+                }
+                self.hits.push((r, Hit::Item(idx)));
+            }
+        }
+        if info {
+            let mut lines = vec![
+                cur.label.clone(),
+                format!(
+                    "{} · {}",
+                    dir::human_size(cur.size),
+                    dir::human_time(cur.mtime)
+                ),
+            ];
+            if let Some(x) = &exif {
+                let l = x.line();
+                if !l.is_empty() {
+                    lines.push(l);
+                }
+                if let (Some(a), Some(b)) = (x.width, x.height) {
+                    lines.push(format!("{a} × {b} px"));
+                }
+            }
+            let bw = lines
+                .iter()
+                .map(|l| self.text.width(l, small))
+                .max()
+                .unwrap_or(0)
+                + 4 * pad;
+            let bh = lines.len() as i32 * small.height + 2 * pad;
+            let r = Rect::new(
+                2 * pad,
+                area.y + area.h - bh - 2 * pad,
+                bw.min(w - 4 * pad),
+                bh,
+            );
+            self.cv.tint(r, p.background, 210);
+            self.cv.frame(r, p.border);
+            for (k, l) in lines.iter().enumerate() {
+                let col = if k == 0 { p.foreground } else { p.muted };
+                self.text.draw(
+                    &mut self.cv,
+                    r.x + 2 * pad,
+                    r.y + pad + k as i32 * small.height,
+                    l,
+                    small,
+                    col,
+                );
+            }
+        }
+        if let Some((m, _)) = self.message.clone() {
+            let mw = self.text.width(&m, small) + 4 * pad;
+            let r = Rect::new((w - mw) / 2, area.y + 2 * pad, mw, small.height + pad);
+            self.cv.tint(r, p.background, 220);
+            self.text.draw(
+                &mut self.cv,
+                r.x + 2 * pad,
+                r.y + pad / 2,
+                &m,
+                small,
+                p.accent,
+            );
         }
     }
 }

@@ -5,6 +5,7 @@ mod archive;
 mod canvas;
 mod devices;
 mod dir;
+mod exif;
 mod icons;
 mod logo;
 mod mime;

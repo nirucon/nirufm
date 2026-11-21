@@ -268,3 +268,35 @@ pub fn scale_to_fit(img: &Image, w: i32, h: i32) -> Image {
         data: out,
     }
 }
+
+/// Turn a premultiplied image by quarter turns clockwise.
+pub fn rotate(img: &Image, quarters: u8) -> Image {
+    let q = quarters % 4;
+    if q == 0 {
+        return Image {
+            w: img.w,
+            h: img.h,
+            data: img.data.clone(),
+        };
+    }
+    let (w, h) = (img.w as usize, img.h as usize);
+    let (nw, nh) = if q % 2 == 1 { (h, w) } else { (w, h) };
+    let mut out = vec![0u8; nw * nh * 4];
+    for y in 0..h {
+        for x in 0..w {
+            let (nx, ny) = match q {
+                1 => (h - 1 - y, x),
+                2 => (w - 1 - x, h - 1 - y),
+                _ => (y, w - 1 - x),
+            };
+            let s = (y * w + x) * 4;
+            let d = (ny * nw + nx) * 4;
+            out[d..d + 4].copy_from_slice(&img.data[s..s + 4]);
+        }
+    }
+    Image {
+        w: nw as i32,
+        h: nh as i32,
+        data: out,
+    }
+}

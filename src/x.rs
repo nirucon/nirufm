@@ -35,6 +35,8 @@ pub struct Atoms {
     pub xdnd_copy: Atom,
     pub xdnd_move: Atom,
     pub dnd_prop: Atom,
+    pub net_wm_state: Atom,
+    pub fullscreen: Atom,
 }
 
 struct Shm {
@@ -93,6 +95,8 @@ impl X {
             xdnd_copy: atom(&c, "XdndActionCopy")?,
             xdnd_move: atom(&c, "XdndActionMove")?,
             dnd_prop: atom(&c, "_NIRUFM_DND")?,
+            net_wm_state: atom(&c, "_NET_WM_STATE")?,
+            fullscreen: atom(&c, "_NET_WM_STATE_FULLSCREEN")?,
         };
         let win = c.generate_id()?;
         c.create_window(
@@ -555,6 +559,23 @@ impl X {
             x11rb::NONE,
             x11rb::NONE,
             x11rb::CURRENT_TIME,
+        );
+        let _ = self.c.flush();
+    }
+
+    /// Ask the window manager to toggle full screen (EWMH).
+    pub fn toggle_fullscreen(&self, on: bool) {
+        let ev = ClientMessageEvent::new(
+            32,
+            self.win,
+            self.atoms.net_wm_state,
+            [u32::from(on), self.atoms.fullscreen, 0, 1, 0],
+        );
+        let _ = self.c.send_event(
+            false,
+            self.root,
+            EventMask::SUBSTRUCTURE_REDIRECT | EventMask::SUBSTRUCTURE_NOTIFY,
+            ev,
         );
         let _ = self.c.flush();
     }
