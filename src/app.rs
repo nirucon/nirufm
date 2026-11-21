@@ -101,6 +101,7 @@ enum Hit {
     View(View),
     Content,
     MenuItem(usize),
+    Pane(usize),
     Eject(usize),
     MenuOutside,
 }
@@ -191,6 +192,9 @@ pub struct App {
     folders: std::collections::HashMap<PathBuf, (View, usize, SortKey, bool)>,
     gallery: Option<Gallery>,
     search_edit: Option<String>,
+    /// Two panes side by side: the tabs shown left and right.
+    split: Option<(usize, usize)>,
+    props: Option<Props>,
     search_due: Option<Instant>,
     search_gen: std::sync::Arc<std::sync::atomic::AtomicUsize>,
     searching: bool,
@@ -263,6 +267,14 @@ struct Preview {
     ready: bool,
 }
 
+/// The properties sheet: totals are counted on a thread.
+struct Props {
+    paths: Vec<PathBuf>,
+    /// bytes, files, folders, done
+    totals: std::sync::Arc<std::sync::Mutex<(u64, u64, u64, bool)>>,
+    sha: std::sync::Arc<std::sync::Mutex<Option<String>>>,
+}
+
 struct Running {
     verb: &'static str,
     done: u64,
@@ -297,6 +309,7 @@ enum Act {
     NcInternal,
     NcShare,
     NcBrowser,
+    Props,
     OpenWith(u8),
 }
 
@@ -436,6 +449,8 @@ impl App {
             folders: load_folders(),
             gallery: None,
             search_edit: None,
+            split: None,
+            props: None,
             search_due: None,
             search_gen: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             searching: false,
@@ -665,6 +680,7 @@ impl App {
             return;
         }
         self.tabs.remove(i);
+        self.split = None;
         if self.active >= self.tabs.len() || self.active > i {
             self.active = self.active.saturating_sub(1);
         }
@@ -674,6 +690,12 @@ impl App {
 
     fn switch(&mut self, i: usize) {
         if i < self.tabs.len() && i != self.active {
+            // In two panes, a tab shown nowhere takes the active pane.
+            if let Some((l, r)) = self.split {
+                if i != l && i != r {
+                    self.split = Some(if self.active == l { (i, r) } else { (l, i) });
+                }
+            }
             self.active = i;
             let p = self.tabs[i].path.clone();
             self.apply_memory(&p);
@@ -1267,6 +1289,7 @@ impl App {
             (2, Hit::Tab(i)) | (1, Hit::TabClose(i)) => self.close_tab(i),
             (1, Hit::Crumb(p)) => self.go(p),
             (2, Hit::Crumb(p)) => self.new_tab(p),
+            (1 | 3, Hit::Pane(k)) => self.focus_pane(k),
             (1, Hit::Back) => self.back(),
             (1, Hit::View(v)) => self.set_view(v),
             (1, Hit::Forward) => self.forward(),
@@ -1323,6 +1346,14 @@ impl App {
         let alt = state.contains(KeyButMask::MOD1);
         if self.gallery.is_some() {
             return self.gallery_key(sym, ctrl);
+        }
+        if self.props.is_some() {
+            match sym {
+                0x73 => self.props_checksum(), // s
+                _ => self.props = None,
+            }
+            self.dirty = true;
+            return;
         }
         if self.connect.is_some() {
             return self.connect_key(sym, ctrl, shift);
@@ -1398,6 +1429,12 @@ impl App {
                 }
             }
             0xffbf => self.act(Act::Rename), // F2
+            0xffc0 => self.toggle_split(),   // F3
+            0xff09 if !ctrl && self.split.is_some() => {
+                if let Some((other, _)) = self.other_pane() {
+                    self.focus_pane(other);
+                }
+            }
             0x20 if !ctrl
                 && (self.typed.is_empty()
                     || self.typed_at.elapsed() > Duration::from_millis(900)) =>
@@ -1413,7 +1450,7 @@ impl App {
             }
             0xff0d | 0xff8d => {
                 if alt {
-                    return;
+                    return self.open_props();
                 }
                 self.open_selection();
             }
@@ -1665,9 +1702,66 @@ impl App {
             self.cv.w - m.side_w - 1,
             self.cv.h - top - m.status_h,
         );
+        if let Some((l, _)) = self.split {
+            let half = self.content.w / 2;
+            self.content = if self.active == l {
+                Rect::new(self.content.x, self.content.y, half - 1, self.content.h)
+            } else {
+                Rect::new(
+                    self.content.x + half + 1,
+                    self.content.y,
+                    self.content.w - half - 1,
+                    self.content.h,
+                )
+            };
+        }
         let pad = m.pad;
         let (cw, _, _) = self.grid();
         self.cols = ((self.content.w - 2 * pad) / cw).max(1);
+    }
+
+    /// The other pane: its tab and rectangle.
+    fn other_pane(&self) -> Option<(usize, Rect)> {
+        let (l, r) = self.split?;
+        let other = if self.active == l { r } else { l };
+        let c = self.content;
+        let full_x = self.m.side_w + 1;
+        let full_w = self.cv.w - self.m.side_w - 1;
+        let half = full_w / 2;
+        let rect = if other == l {
+            Rect::new(full_x, c.y, half - 1, c.h)
+        } else {
+            Rect::new(full_x + half + 1, c.y, full_w - half - 1, c.h)
+        };
+        Some((other, rect))
+    }
+
+    fn toggle_split(&mut self) {
+        if self.split.take().is_some() {
+            self.dirty = true;
+            return;
+        }
+        if self.tabs.len() == 1 {
+            let p = self.tab().path.clone();
+            self.tabs.push(Tab::new(p));
+            let k = self.tabs.len() - 1;
+            self.load_tab(k, true);
+            self.split = Some((self.active, k));
+        } else {
+            let other = (self.active + 1) % self.tabs.len();
+            self.split = Some((self.active.min(other), self.active.max(other)));
+        }
+        self.dirty = true;
+    }
+
+    fn focus_pane(&mut self, idx: usize) {
+        if idx != self.active {
+            self.active = idx;
+            let p = self.tabs[idx].path.clone();
+            self.apply_memory(&p);
+            self.rewatch();
+            self.dirty = true;
+        }
     }
 
     fn draw(&mut self) {
@@ -1683,7 +1777,45 @@ impl App {
         if self.tabs.len() > 1 {
             self.draw_tabs();
         }
+        if let Some((other, rect)) = self.other_pane() {
+            // Draw the other pane as if it were active, then make it one
+            // clickable area that focuses it.
+            let (keep_active, keep_content, keep_cols) = (self.active, self.content, self.cols);
+            let keep_hover = self.hover.take();
+            self.active = other;
+            self.content = rect;
+            let (cw, _, _) = self.grid();
+            self.cols = ((rect.w - 2 * self.m.pad) / cw).max(1);
+            let mark = self.hits.len();
+            self.draw_content();
+            self.hits.truncate(mark);
+            self.cv.tint(rect, self.p.background, 70);
+            self.hits.push((rect, Hit::Pane(other)));
+            self.active = keep_active;
+            self.content = keep_content;
+            self.cols = keep_cols;
+            self.hover = keep_hover;
+            let line = Rect::new(
+                rect.x.max(keep_content.x) - 1
+                    + if rect.x > keep_content.x {
+                        0
+                    } else {
+                        rect.w + 1
+                    },
+                rect.y,
+                1,
+                rect.h,
+            );
+            self.cv.fill(line, self.p.border);
+        }
         self.draw_content();
+        if self.split.is_some() {
+            let c = self.content;
+            self.cv.fill(
+                Rect::new(c.x, c.y, c.w, (2.0 * self.m.s).max(2.0) as i32),
+                self.p.accent,
+            );
+        }
         self.draw_status();
         self.draw_rename();
         self.draw_menu();
@@ -1693,6 +1825,7 @@ impl App {
             return;
         }
         self.draw_preview();
+        self.draw_props();
         self.draw_confirm();
         self.draw_connect();
     }
@@ -2786,6 +2919,7 @@ impl App {
                 }
             }
             Act::Connect => self.open_connect(None, None),
+            Act::Props => self.open_props(),
             Act::OpenWith(k) => {
                 if let Some(app) = self.menu_apps.get(k as usize).cloned() {
                     crate::apps::launch(&app, &sel, &here);
@@ -3009,6 +3143,7 @@ impl App {
                 items.push(("Pack as .tar.gz".into(), Act::PackTar, ""));
                 items.push(("Move to the trash".into(), Act::Trash, "Del"));
                 items.push(("Delete permanently".into(), Act::Delete, "Shift+Del"));
+                items.push(("Properties".into(), Act::Props, "Alt+Enter"));
             }
         } else {
             if !trash {
@@ -3779,7 +3914,9 @@ impl App {
                 let pl = self.places.get(i)?;
                 (pl.mounted && !pl.connect && ok(&pl.path)).then_some(DropAt::Place(i))
             }
-            Hit::Tab(i) | Hit::TabClose(i) => ok(&self.tabs.get(i)?.path).then_some(DropAt::Tab(i)),
+            Hit::Tab(i) | Hit::TabClose(i) | Hit::Pane(i) => {
+                ok(&self.tabs.get(i)?.path).then_some(DropAt::Tab(i))
+            }
             Hit::Content | Hit::Header(_) => Some(DropAt::Here),
             _ => None,
         }
@@ -4890,6 +5027,262 @@ impl App {
         });
         self.dirty = true;
     }
+}
+
+impl App {
+    fn open_props(&mut self) {
+        let paths = self.selection_paths();
+        let paths = if paths.is_empty() {
+            vec![self.tab().path.clone()]
+        } else {
+            paths
+        };
+        let totals = std::sync::Arc::new(std::sync::Mutex::new((0u64, 0u64, 0u64, false)));
+        let (t, list, wake) = (totals.clone(), paths.clone(), self.wake);
+        std::thread::spawn(move || {
+            let mut last = Instant::now();
+            let mut stack: Vec<PathBuf> = list;
+            while let Some(p) = stack.pop() {
+                let Ok(m) = std::fs::symlink_metadata(&p) else {
+                    continue;
+                };
+                if let Ok(mut g) = t.lock() {
+                    if m.is_dir() {
+                        g.2 += 1;
+                    } else {
+                        g.0 += m.len();
+                        g.1 += 1;
+                    }
+                }
+                if m.is_dir() {
+                    if let Ok(rd) = std::fs::read_dir(&p) {
+                        stack.extend(rd.flatten().map(|e| e.path()));
+                    }
+                }
+                if last.elapsed() > Duration::from_millis(150) {
+                    last = Instant::now();
+                    crate::ops::poke(wake);
+                }
+            }
+            if let Ok(mut g) = t.lock() {
+                g.3 = true;
+            }
+            crate::ops::poke(wake);
+        });
+        self.props = Some(Props {
+            paths,
+            totals,
+            sha: std::sync::Arc::new(std::sync::Mutex::new(None)),
+        });
+        self.dirty = true;
+    }
+
+    fn props_checksum(&mut self) {
+        let Some(pr) = self.props.as_ref() else {
+            return;
+        };
+        if pr.paths.len() != 1 || pr.paths[0].is_dir() {
+            return;
+        }
+        let (path, sha, wake) = (pr.paths[0].clone(), pr.sha.clone(), self.wake);
+        if let Ok(mut g) = sha.lock() {
+            *g = Some("computing…".into());
+        }
+        std::thread::spawn(move || {
+            let out = std::process::Command::new("sha256sum").arg(&path).output();
+            let v = match out {
+                Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout)
+                    .split_whitespace()
+                    .next()
+                    .unwrap_or("")
+                    .to_string(),
+                _ => "sha256sum failed".into(),
+            };
+            if let Ok(mut g) = sha.lock() {
+                *g = Some(v);
+            }
+            crate::ops::poke(wake);
+        });
+    }
+
+    fn draw_props(&mut self) {
+        let Some(pr) = self.props.as_ref() else {
+            return;
+        };
+        let p = self.p;
+        let (font, small, pad) = (self.m.font, self.m.small, self.m.pad);
+        let paths = pr.paths.clone();
+        let (bytes, files, dirs, done) = pr.totals.lock().map(|g| *g).unwrap_or_default();
+        let sha = pr.sha.lock().ok().and_then(|g| g.clone());
+        let mut rows: Vec<(String, String)> = Vec::new();
+        let title;
+        if paths.len() == 1 {
+            use std::os::unix::fs::MetadataExt;
+            let path = &paths[0];
+            title = path
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_else(|| path.display().to_string());
+            let lm = std::fs::symlink_metadata(path).ok();
+            let m = std::fs::metadata(path).ok().or(lm.clone());
+            let is_dir = m.as_ref().is_some_and(|m| m.is_dir());
+            let mime = if is_dir {
+                "folder".to_string()
+            } else {
+                self.mime.for_name(&title).to_string()
+            };
+            rows.push(("Type".into(), mime));
+            rows.push((
+                "Location".into(),
+                path.parent().map(places::pretty).unwrap_or_default(),
+            ));
+            if lm.as_ref().is_some_and(|m| m.file_type().is_symlink()) {
+                rows.push((
+                    "Link to".into(),
+                    std::fs::read_link(path)
+                        .map(|t| t.display().to_string())
+                        .unwrap_or_default(),
+                ));
+            }
+            let size = if is_dir {
+                format!(
+                    "{} in {files} files, {} folders{}",
+                    dir::human_size(bytes),
+                    dirs.saturating_sub(1),
+                    if done { "" } else { " (counting…)" }
+                )
+            } else {
+                format!("{} ({bytes} bytes)", dir::human_size(bytes))
+            };
+            rows.push(("Size".into(), size));
+            if let Some(m) = &m {
+                rows.push(("Modified".into(), dir::human_time(m.mtime())));
+                rows.push(("Accessed".into(), dir::human_time(m.atime())));
+                let mode = m.mode() & 0o7777;
+                rows.push((
+                    "Permissions".into(),
+                    format!("{} ({mode:o})", perm_string(mode, is_dir)),
+                ));
+                rows.push((
+                    "Owner".into(),
+                    format!("{}:{}", user_name(m.uid()), group_name(m.gid())),
+                ));
+            }
+            if let Some((free, total)) = dir::space(path) {
+                rows.push((
+                    "Disk".into(),
+                    format!(
+                        "{} free of {}",
+                        dir::human_size(free),
+                        dir::human_size(total)
+                    ),
+                ));
+            }
+            if !is_dir {
+                rows.push((
+                    "SHA-256".into(),
+                    sha.unwrap_or_else(|| "press S to compute".into()),
+                ));
+            }
+        } else {
+            title = format!("{} items", paths.len());
+            rows.push((
+                "Size".into(),
+                format!(
+                    "{} in {files} files, {dirs} folders{}",
+                    dir::human_size(bytes),
+                    if done { "" } else { " (counting…)" }
+                ),
+            ));
+        }
+        let label_w = rows
+            .iter()
+            .map(|(k, _)| self.text.width(k, small))
+            .max()
+            .unwrap_or(0)
+            + 2 * pad;
+        let val_w = rows
+            .iter()
+            .map(|(_, v)| self.text.width(v, small))
+            .max()
+            .unwrap_or(0);
+        let w = (label_w + val_w + 6 * pad)
+            .max((360.0 * self.m.s) as i32)
+            .min(self.cv.w - 4 * pad);
+        let row_h = small.height + pad / 2;
+        let h = 4 * pad + font.height + rows.len() as i32 * row_h + small.height + 2 * pad;
+        let r = Rect::new((self.cv.w - w) / 2, (self.cv.h - h) / 3, w, h);
+        self.cv
+            .tint(Rect::new(0, 0, self.cv.w, self.cv.h), p.background, 140);
+        let sh = (4.0 * self.m.s) as i32;
+        self.cv
+            .tint(Rect::new(r.x + sh, r.y + sh, r.w, r.h), 0x000000, 120);
+        self.cv.fill(r, p.surface);
+        self.cv.frame(r, p.accent);
+        let t = self.text.ellipsize(&title, font, w - 4 * pad);
+        self.text.draw(
+            &mut self.cv,
+            r.x + 2 * pad,
+            r.y + 2 * pad,
+            &t,
+            font,
+            p.foreground,
+        );
+        let mut y = r.y + 3 * pad + font.height;
+        for (k, v) in rows {
+            self.text
+                .draw(&mut self.cv, r.x + 2 * pad, y, &k, small, p.muted);
+            let v = self.text.ellipsize(&v, small, w - label_w - 4 * pad);
+            self.text.draw(
+                &mut self.cv,
+                r.x + 2 * pad + label_w,
+                y,
+                &v,
+                small,
+                p.foreground,
+            );
+            y += row_h;
+        }
+        self.text.draw(
+            &mut self.cv,
+            r.x + 2 * pad,
+            y + pad / 2,
+            "S checksum · any key closes",
+            small,
+            p.muted,
+        );
+    }
+}
+
+fn perm_string(mode: u32, dir: bool) -> String {
+    let mut s = String::from(if dir { "d" } else { "-" });
+    for shift in [6, 3, 0] {
+        let b = (mode >> shift) & 7;
+        s.push(if b & 4 != 0 { 'r' } else { '-' });
+        s.push(if b & 2 != 0 { 'w' } else { '-' });
+        s.push(if b & 1 != 0 { 'x' } else { '-' });
+    }
+    s
+}
+
+fn user_name(uid: u32) -> String {
+    let pw = unsafe { libc::getpwuid(uid) };
+    if pw.is_null() {
+        return uid.to_string();
+    }
+    unsafe { std::ffi::CStr::from_ptr((*pw).pw_name) }
+        .to_string_lossy()
+        .into_owned()
+}
+
+fn group_name(gid: u32) -> String {
+    let gr = unsafe { libc::getgrgid(gid) };
+    if gr.is_null() {
+        return gid.to_string();
+    }
+    unsafe { std::ffi::CStr::from_ptr((*gr).gr_name) }
+        .to_string_lossy()
+        .into_owned()
 }
 
 /// Icon sizes of the zoom steps (Ctrl+wheel, Ctrl+plus/minus).
