@@ -65,6 +65,9 @@ pub fn places() -> Vec<Place> {
             .unwrap_or_else(|| home.join(fallback))
     };
     let mut v = vec![Place::local("Home", home.clone(), "user-home")];
+    let mut recent = Place::local("Recent", PathBuf::new(), "document-open-recent");
+    recent.mounted = false;
+    v.push(recent);
     for (key, fallback, label, icon) in [
         ("DESKTOP", "Desktop", "Desktop", "user-desktop"),
         ("DOCUMENTS", "Documents", "Documents", "folder-documents"),
@@ -240,6 +243,38 @@ pub fn pretty(p: &Path) -> String {
         Ok(rest) => format!("~/{}", rest.display()),
         Err(_) => p.display().to_string(),
     }
+}
+
+/// Recently used files (`recently-used.xbel`), newest first, existing only.
+pub fn recent_files(limit: usize) -> Vec<PathBuf> {
+    let file = std::env::var_os("XDG_DATA_HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| crate::theme::home().join(".local/share"))
+        .join("recently-used.xbel");
+    let text = std::fs::read_to_string(file).unwrap_or_default();
+    let mut items: Vec<(String, PathBuf)> = Vec::new();
+    for chunk in text.split("<bookmark ").skip(1) {
+        let attr = |name: &str| {
+            chunk
+                .split(&format!("{name}=\""))
+                .nth(1)
+                .and_then(|r| r.split('"').next())
+                .map(str::to_string)
+        };
+        let (Some(href), Some(when)) = (attr("href"), attr("modified").or_else(|| attr("visited")))
+        else {
+            continue;
+        };
+        if let Some(rest) = href.strip_prefix("file://") {
+            let p = crate::ops::decode_path(&rest.replace("&amp;", "&"));
+            if p.is_file() {
+                items.push((when, p));
+            }
+        }
+    }
+    items.sort_by(|a, b| b.0.cmp(&a.0));
+    items.dedup_by(|a, b| a.1 == b.1);
+    items.into_iter().take(limit).map(|(_, p)| p).collect()
 }
 
 #[cfg(test)]

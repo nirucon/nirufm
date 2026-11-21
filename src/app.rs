@@ -1254,7 +1254,9 @@ impl App {
         match (b, h) {
             (1, Hit::Place(i)) => {
                 if let Some(pl) = self.places.get(i).cloned() {
-                    if pl.connect {
+                    if pl.icon == "document-open-recent" {
+                        self.show_recent();
+                    } else if pl.connect {
                         self.open_connect(None, None);
                     } else if let (Some(dev), false) = (&pl.dev, pl.mounted) {
                         self.submit(crate::ops::Job::Mount { dev: dev.clone() });
@@ -5630,6 +5632,36 @@ fn play_sound(event: &'static str) {
                 .status();
         }
     });
+}
+
+impl App {
+    /// Recently used files as a list, like search results.
+    fn show_recent(&mut self) {
+        self.search_gen
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.searching = false;
+        let files = places::recent_files(200);
+        let entries: Vec<Entry> = files
+            .iter()
+            .filter_map(|p| dir::read_one(p, &self.mime).ok())
+            .collect();
+        let home = theme::home();
+        let t = self.tab_mut();
+        t.path = home;
+        t.search = Some("recent files".into());
+        t.all = entries;
+        t.shown = (0..t.all.len()).collect();
+        t.selected = vec![false; t.all.len()];
+        t.cursor = 0;
+        t.anchor = 0;
+        t.scroll = 0;
+        t.error = None;
+        if self.view != View::List {
+            self.view = View::List;
+            self.layout_only();
+        }
+        self.dirty = true;
+    }
 }
 
 /// Icon sizes of the zoom steps (Ctrl+wheel, Ctrl+plus/minus).
