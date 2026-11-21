@@ -14,6 +14,7 @@ use std::time::{Duration, Instant};
 use x11rb::connection::Connection;
 use x11rb::protocol::xproto::*;
 use x11rb::protocol::Event;
+use x11rb::wrapper::ConnectionExt as _;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum View {
@@ -154,6 +155,37 @@ pub struct App {
     side_total: i32,
     apps: Option<crate::apps::Apps>,
     menu_apps: Vec<crate::apps::App>,
+    press: Option<(i32, i32)>,
+    single_on_release: Option<usize>,
+    drag: Option<DragOut>,
+    drag_in: Option<DragIn>,
+    drop_target: Option<DropAt>,
+    dropped_files: Option<Vec<PathBuf>>,
+}
+
+/// Files being dragged out of this window.
+struct DragOut {
+    files: Vec<PathBuf>,
+    target: Option<(Window, u32)>,
+    accepted: bool,
+    finished_wait: Option<Instant>,
+}
+
+/// Another program dragging over this window.
+struct DragIn {
+    source: Window,
+    version: u32,
+    files_offered: bool,
+    move_offered: bool,
+}
+
+/// Where a drop would land: a folder item, a place, a tab or the folder shown.
+#[derive(Clone, Debug, PartialEq)]
+enum DropAt {
+    Item(usize),
+    Place(usize),
+    Tab(usize),
+    Here,
 }
 
 struct ConnectForm {
@@ -336,6 +368,12 @@ impl App {
             side_total: 0,
             apps: None,
             menu_apps: Vec::new(),
+            press: None,
+            single_on_release: None,
+            drag: None,
+            drag_in: None,
+            drop_target: None,
+            dropped_files: None,
         };
         app.load_tab(0, true);
         app.x.map()?;
@@ -830,6 +868,9 @@ impl App {
                     self.dirty = true;
                 }
             }
+            Event::ClientMessage(e) if self.is_xdnd(e.type_) => {
+                self.xdnd_message(e.type_, e.data.as_data32())
+            }
             Event::ClientMessage(e) => {
                 if e.type_ == self.x.atoms.wm_protocols
                     && e.data.as_data32()[0] == self.x.atoms.wm_delete
@@ -843,12 +884,40 @@ impl App {
                 }
             }
             Event::SelectionRequest(e) => {
-                if let Some((files, cut)) = self.clip.clone() {
+                if e.selection == self.x.atoms.xdnd_selection {
+                    if let Some(d) = &self.drag {
+                        let _ = self.x.answer(&e, &d.files.clone(), false);
+                    } else if let Some(files) = self.dropped_files.clone() {
+                        let _ = self.x.answer(&e, &files, false);
+                    }
+                } else if let Some((files, cut)) = self.clip.clone() {
                     let _ = self.x.answer(&e, &files, cut);
                 }
             }
             Event::SelectionClear(_) => {}
+            Event::SelectionNotify(e) if e.selection == self.x.atoms.xdnd_selection => {
+                self.drop_data(e.property)
+            }
             Event::SelectionNotify(e) => self.pasted(e.target, e.property),
+            Event::ButtonRelease(e) if e.detail == 1 => self.release(
+                e.event_x as i32,
+                e.event_y as i32,
+                e.root_x,
+                e.root_y,
+                e.state,
+            ),
+            Event::MotionNotify(e)
+                if self.drag.is_some()
+                    || (e.state.contains(KeyButMask::BUTTON1) && self.press.is_some()) =>
+            {
+                self.drag_motion(
+                    e.event_x as i32,
+                    e.event_y as i32,
+                    e.root_x,
+                    e.root_y,
+                    e.state,
+                )
+            }
             Event::MotionNotify(e) if self.menu.is_some() => {
                 let (x, y) = (e.event_x as i32, e.event_y as i32);
                 let h = match self.hit(x, y) {
@@ -1062,7 +1131,17 @@ impl App {
                     self.open(i);
                 } else {
                     self.last_click = Some((Instant::now(), i));
-                    self.set_cursor(i, shift, ctrl);
+                    let already = self.tab().selected.get(i).copied().unwrap_or(false);
+                    // A press on a selection may start a drag of all of it;
+                    // the selection becomes just this item only on release.
+                    if already && !ctrl && !shift {
+                        self.tab_mut().cursor = i;
+                        self.single_on_release = Some(i);
+                        self.dirty = true;
+                    } else {
+                        self.set_cursor(i, shift, ctrl);
+                    }
+                    self.press = Some((x, y));
                 }
             }
             (2, Hit::Item(i)) => {
@@ -1428,6 +1507,7 @@ impl App {
         self.draw_status();
         self.draw_rename();
         self.draw_menu();
+        self.draw_drop_target();
         self.draw_preview();
         self.draw_confirm();
         self.draw_connect();
@@ -3351,6 +3431,362 @@ impl App {
         };
         self.text
             .draw(&mut self.cv, r.x + 2 * pad, y, keys, small, p.muted);
+    }
+}
+
+impl App {
+    fn is_xdnd(&self, t: u32) -> bool {
+        let a = &self.x.atoms;
+        [
+            a.xdnd_enter,
+            a.xdnd_position,
+            a.xdnd_status,
+            a.xdnd_leave,
+            a.xdnd_drop,
+            a.xdnd_finished,
+        ]
+        .contains(&t)
+    }
+
+    /// Where a drop at window position (x, y) lands, if anywhere.
+    fn drop_at(&self, x: i32, y: i32, dragged: &[PathBuf]) -> Option<DropAt> {
+        let ok = |p: &Path| !dragged.iter().any(|d| p.starts_with(d));
+        match self.hit(x, y)? {
+            Hit::Item(i) => {
+                let e = self.tab().entry(i)?;
+                if e.is_dir {
+                    ok(&e.path).then_some(DropAt::Item(i))
+                } else {
+                    Some(DropAt::Here)
+                }
+            }
+            Hit::Place(i) => {
+                let pl = self.places.get(i)?;
+                (pl.mounted && !pl.connect && ok(&pl.path)).then_some(DropAt::Place(i))
+            }
+            Hit::Tab(i) | Hit::TabClose(i) => ok(&self.tabs.get(i)?.path).then_some(DropAt::Tab(i)),
+            Hit::Content | Hit::Header(_) => Some(DropAt::Here),
+            _ => None,
+        }
+    }
+
+    fn drop_dir(&self, at: &DropAt) -> Option<PathBuf> {
+        match at {
+            DropAt::Item(i) => self.tab().entry(*i).map(|e| e.path.clone()),
+            DropAt::Place(i) => self.places.get(*i).map(|p| p.path.clone()),
+            DropAt::Tab(i) => self.tabs.get(*i).map(|t| t.path.clone()),
+            DropAt::Here => Some(self.tab().path.clone()),
+        }
+    }
+
+    fn drag_motion(&mut self, x: i32, y: i32, rx: i16, ry: i16, state: KeyButMask) {
+        if self.drag.is_none() {
+            let Some((px, py)) = self.press else { return };
+            let far = (x - px).abs() > (6.0 * self.m.s) as i32
+                || (y - py).abs() > (6.0 * self.m.s) as i32;
+            if !far {
+                return;
+            }
+            // Start dragging the selection.
+            let files = self.selection_paths();
+            if files.is_empty() {
+                self.press = None;
+                return;
+            }
+            let a = &self.x.atoms;
+            let _ = self
+                .x
+                .c
+                .set_selection_owner(self.x.win, a.xdnd_selection, x11rb::CURRENT_TIME);
+            let _ = self.x.c.change_property32(
+                PropMode::REPLACE,
+                self.x.win,
+                a.xdnd_type_list,
+                AtomEnum::ATOM,
+                &[a.uri_list, a.utf8],
+            );
+            self.x.grab();
+            self.single_on_release = None;
+            self.drag = Some(DragOut {
+                files,
+                target: None,
+                accepted: false,
+                finished_wait: None,
+            });
+        }
+        let target = self.x.xdnd_target(rx, ry);
+        let own = target.is_some_and(|(w, _)| w == self.x.win);
+        let files = self
+            .drag
+            .as_ref()
+            .map(|d| d.files.clone())
+            .unwrap_or_default();
+        let prev = self.drag.as_ref().and_then(|d| d.target);
+        let a = (
+            self.x.atoms.xdnd_enter,
+            self.x.atoms.xdnd_leave,
+            self.x.atoms.xdnd_position,
+            self.x.atoms.uri_list,
+            self.x.atoms.utf8,
+        );
+        let win = self.x.win;
+        if prev.map(|p| p.0) != target.map(|t| t.0) {
+            if let Some((w, _)) = prev.filter(|p| p.0 != win) {
+                self.x.send_client(w, a.1, [win, 0, 0, 0, 0]);
+            }
+            if let Some((w, v)) = target.filter(|t| t.0 != win) {
+                self.x.send_client(w, a.0, [win, v << 24, a.3, a.4, 0]);
+            }
+            if let Some(d) = self.drag.as_mut() {
+                d.target = target;
+                d.accepted = false;
+            }
+        }
+        if own {
+            let at = self.drop_at(x, y, &files);
+            if at != self.drop_target {
+                self.drop_target = at;
+                self.dirty = true;
+            }
+        } else {
+            if self.drop_target.take().is_some() {
+                self.dirty = true;
+            }
+            if let Some((w, _)) = target {
+                let copy = !state.contains(KeyButMask::SHIFT);
+                let action = if copy {
+                    self.x.atoms.xdnd_copy
+                } else {
+                    self.x.atoms.xdnd_move
+                };
+                let pos = ((rx as u16 as u32) << 16) | ry as u16 as u32;
+                self.x.send_client(w, a.2, [win, 0, pos, 0, action]);
+            }
+        }
+    }
+
+    fn release(&mut self, x: i32, y: i32, _rx: i16, _ry: i16, state: KeyButMask) {
+        self.press = None;
+        let Some(d) = self.drag.take() else {
+            if let Some(i) = self.single_on_release.take() {
+                self.set_cursor(i, false, false);
+            }
+            return;
+        };
+        self.x.ungrab();
+        let win = self.x.win;
+        match d.target {
+            Some((w, _)) if w == win => {
+                let at = self.drop_target.take();
+                if let Some(dest) = at.and_then(|a| self.drop_dir(&a)) {
+                    let ctrl = state.contains(KeyButMask::CONTROL);
+                    let shift = state.contains(KeyButMask::SHIFT);
+                    self.drop_files(d.files, dest, ctrl, shift);
+                }
+                let _ = (x, y);
+            }
+            Some((w, _)) if d.accepted => {
+                self.x
+                    .send_client(w, self.x.atoms.xdnd_drop, [win, 0, 0, 0, 0]);
+                // Keep answering XdndSelection requests for these files.
+                self.dropped_files = Some(d.files);
+                let _ = d.finished_wait;
+            }
+            Some((w, _)) => self
+                .x
+                .send_client(w, self.x.atoms.xdnd_leave, [win, 0, 0, 0, 0]),
+            None => {}
+        }
+        self.dirty = true;
+    }
+
+    /// Files dropped on `dest`: moved within one file system, copied across
+    /// (Ctrl copies, Shift moves, like other file managers).
+    fn drop_files(&mut self, files: Vec<PathBuf>, dest: PathBuf, ctrl: bool, shift: bool) {
+        use std::os::unix::fs::MetadataExt;
+        let files: Vec<PathBuf> = files
+            .into_iter()
+            .filter(|f| f.parent() != Some(dest.as_path()))
+            .collect();
+        if files.is_empty() {
+            return;
+        }
+        let same_fs = std::fs::metadata(&dest).ok().map(|m| m.dev())
+            == std::fs::symlink_metadata(&files[0]).ok().map(|m| m.dev());
+        let mv = shift || (same_fs && !ctrl);
+        if mv {
+            self.submit(crate::ops::Job::Move {
+                srcs: files,
+                dst: dest,
+            });
+        } else {
+            self.submit(crate::ops::Job::Copy {
+                srcs: files,
+                dst: dest,
+            });
+        }
+    }
+
+    fn xdnd_message(&mut self, t: u32, d: [u32; 5]) {
+        let a = (
+            self.x.atoms.xdnd_enter,
+            self.x.atoms.xdnd_position,
+            self.x.atoms.xdnd_status,
+            self.x.atoms.xdnd_leave,
+            self.x.atoms.xdnd_drop,
+            self.x.atoms.xdnd_finished,
+        );
+        let win = self.x.win;
+        if t == a.2 {
+            // XdndStatus: the program under the pointer would take the drop.
+            if let Some(dr) = self.drag.as_mut() {
+                dr.accepted = d[1] & 1 == 1;
+            }
+        } else if t == a.5 {
+            self.dropped_files = None;
+        } else if t == a.0 {
+            let source = d[0];
+            let version = d[1] >> 24;
+            let mut types: Vec<u32> = d[2..5].iter().copied().filter(|x| *x != 0).collect();
+            if d[1] & 1 == 1 {
+                if let Some(v) = self
+                    .x
+                    .c
+                    .get_property(
+                        false,
+                        source,
+                        self.x.atoms.xdnd_type_list,
+                        AtomEnum::ATOM,
+                        0,
+                        64,
+                    )
+                    .ok()
+                    .and_then(|c| c.reply().ok())
+                {
+                    types = v.value32().map(|i| i.collect()).unwrap_or_default();
+                }
+            }
+            let files_offered = types.contains(&self.x.atoms.uri_list);
+            self.drag_in = Some(DragIn {
+                source,
+                version,
+                files_offered,
+                move_offered: false,
+            });
+        } else if t == a.1 {
+            let Some(din) = self.drag_in.as_mut() else {
+                return;
+            };
+            din.move_offered = d[4] == self.x.atoms.xdnd_move;
+            let (rx, ry) = ((d[2] >> 16) as i16, (d[2] & 0xffff) as i16);
+            let (wx, wy) = self.x.to_window(rx, ry);
+            let (src, offered) = (din.source, din.files_offered);
+            let at = if offered {
+                self.drop_at(wx, wy, &[])
+            } else {
+                None
+            };
+            if at != self.drop_target {
+                self.drop_target = at.clone();
+                self.dirty = true;
+            }
+            let accept = u32::from(at.is_some());
+            // Bit 1: keep sending positions, the target changes per item.
+            self.x
+                .send_client(src, a.2, [win, accept | 2, 0, 0, self.x.atoms.xdnd_copy]);
+        } else if t == a.3 {
+            self.drag_in = None;
+            if self.drop_target.take().is_some() {
+                self.dirty = true;
+            }
+        } else if t == a.4 {
+            let time = d[2];
+            if self.drag_in.as_ref().is_some_and(|x| x.files_offered) && self.drop_target.is_some()
+            {
+                let _ = self.x.c.convert_selection(
+                    win,
+                    self.x.atoms.xdnd_selection,
+                    self.x.atoms.uri_list,
+                    self.x.atoms.dnd_prop,
+                    time,
+                );
+                let _ = self.x.c.flush();
+            } else if let Some(din) = self.drag_in.take() {
+                self.x.send_client(din.source, a.5, [win, 0, 0, 0, 0]);
+                self.drop_target = None;
+                self.dirty = true;
+            }
+        }
+    }
+
+    /// The dropped data arrived: copy the files where they were dropped.
+    fn drop_data(&mut self, property: u32) {
+        let din = self.drag_in.take();
+        let at = self.drop_target.take();
+        self.dirty = true;
+        let win = self.x.win;
+        let mut ok = false;
+        if property != x11rb::NONE {
+            let data = self
+                .x
+                .c
+                .get_property(true, win, self.x.atoms.dnd_prop, AtomEnum::ANY, 0, 1 << 24)
+                .ok()
+                .and_then(|c| c.reply().ok())
+                .map(|r| r.value);
+            if let (Some(data), Some(dest)) = (data, at.and_then(|a| self.drop_dir(&a))) {
+                let (files, _) = crate::x::parse_uris(&data);
+                if !files.is_empty() {
+                    ok = true;
+                    self.drop_files(files, dest, true, false);
+                }
+            }
+        }
+        if let Some(d) = din {
+            let _ = d.version;
+            let action = if ok { self.x.atoms.xdnd_copy } else { 0 };
+            self.x.send_client(
+                d.source,
+                self.x.atoms.xdnd_finished,
+                [win, u32::from(ok), action, 0, 0],
+            );
+        }
+    }
+
+    /// A strong accent frame on the folder a drop would land in.
+    fn draw_drop_target(&mut self) {
+        let Some(at) = self.drop_target.clone() else {
+            return;
+        };
+        let p = self.p;
+        let w = (2.0 * self.m.s).max(2.0) as i32;
+        let r = match at {
+            DropAt::Item(i) => self.item_rect(i).intersect(&self.content),
+            DropAt::Here => self.content,
+            DropAt::Place(i) => match self
+                .hits
+                .iter()
+                .find(|(_, h)| matches!(h, Hit::Place(k) if *k == i))
+            {
+                Some((r, _)) => *r,
+                None => return,
+            },
+            DropAt::Tab(i) => match self
+                .hits
+                .iter()
+                .find(|(_, h)| matches!(h, Hit::Tab(k) if *k == i))
+            {
+                Some((r, _)) => *r,
+                None => return,
+            },
+        };
+        if r.w <= 0 || r.h <= 0 {
+            return;
+        }
+        self.cv.tint(r, p.accent, 40);
+        for k in 0..w {
+            self.cv.frame(r.inset(k), p.accent);
+        }
     }
 }
 

@@ -23,6 +23,18 @@ pub struct Atoms {
     pub uri_list: Atom,
     pub gnome_copied: Atom,
     pub sel_prop: Atom,
+    pub xdnd_aware: Atom,
+    pub xdnd_enter: Atom,
+    pub xdnd_position: Atom,
+    pub xdnd_status: Atom,
+    pub xdnd_leave: Atom,
+    pub xdnd_drop: Atom,
+    pub xdnd_finished: Atom,
+    pub xdnd_selection: Atom,
+    pub xdnd_type_list: Atom,
+    pub xdnd_copy: Atom,
+    pub xdnd_move: Atom,
+    pub dnd_prop: Atom,
 }
 
 struct Shm {
@@ -69,6 +81,18 @@ impl X {
             uri_list: atom(&c, "text/uri-list")?,
             gnome_copied: atom(&c, "x-special/gnome-copied-files")?,
             sel_prop: atom(&c, "_NIRUFM_SELECTION")?,
+            xdnd_aware: atom(&c, "XdndAware")?,
+            xdnd_enter: atom(&c, "XdndEnter")?,
+            xdnd_position: atom(&c, "XdndPosition")?,
+            xdnd_status: atom(&c, "XdndStatus")?,
+            xdnd_leave: atom(&c, "XdndLeave")?,
+            xdnd_drop: atom(&c, "XdndDrop")?,
+            xdnd_finished: atom(&c, "XdndFinished")?,
+            xdnd_selection: atom(&c, "XdndSelection")?,
+            xdnd_type_list: atom(&c, "XdndTypeList")?,
+            xdnd_copy: atom(&c, "XdndActionCopy")?,
+            xdnd_move: atom(&c, "XdndActionMove")?,
+            dnd_prop: atom(&c, "_NIRUFM_DND")?,
         };
         let win = c.generate_id()?;
         c.create_window(
@@ -109,6 +133,14 @@ impl X {
             AtomEnum::WM_CLASS,
             AtomEnum::STRING,
             b"nirufm\0NIRUFM\0",
+        )?;
+        // Files can be dropped on the window (XDND version 5).
+        c.change_property32(
+            PropMode::REPLACE,
+            win,
+            atoms.xdnd_aware,
+            AtomEnum::ATOM,
+            &[5],
         )?;
         c.change_property32(
             PropMode::REPLACE,
@@ -466,6 +498,70 @@ impl X {
             .send_event(false, e.requestor, EventMask::NO_EVENT, ev)?;
         self.c.flush()?;
         Ok(())
+    }
+}
+
+impl X {
+    pub fn send_client(&self, to: Window, kind: Atom, data: [u32; 5]) {
+        let ev = ClientMessageEvent::new(32, to, kind, data);
+        let _ = self.c.send_event(false, to, EventMask::NO_EVENT, ev);
+        let _ = self.c.flush();
+    }
+
+    /// The XDND-aware window under a root position (and its version).
+    pub fn xdnd_target(&self, x: i16, y: i16) -> Option<(Window, u32)> {
+        let mut w = self.root;
+        for _ in 0..16 {
+            let r = self
+                .c
+                .translate_coordinates(self.root, w, x, y)
+                .ok()?
+                .reply()
+                .ok()?;
+            if r.child == x11rb::NONE {
+                return None;
+            }
+            w = r.child;
+            let aware = self
+                .c
+                .get_property(false, w, self.atoms.xdnd_aware, AtomEnum::ATOM, 0, 1)
+                .ok()
+                .and_then(|c| c.reply().ok())
+                .and_then(|r| r.value32().and_then(|mut v| v.next()));
+            if let Some(v) = aware {
+                return Some((w, v.min(5)));
+            }
+        }
+        None
+    }
+
+    pub fn to_window(&self, x: i16, y: i16) -> (i32, i32) {
+        self.c
+            .translate_coordinates(self.root, self.win, x, y)
+            .ok()
+            .and_then(|c| c.reply().ok())
+            .map(|r| (r.dst_x as i32, r.dst_y as i32))
+            .unwrap_or((-1, -1))
+    }
+
+    pub fn grab(&self) {
+        let mask = EventMask::POINTER_MOTION | EventMask::BUTTON_RELEASE | EventMask::BUTTON_PRESS;
+        let _ = self.c.grab_pointer(
+            false,
+            self.win,
+            mask,
+            GrabMode::ASYNC,
+            GrabMode::ASYNC,
+            x11rb::NONE,
+            x11rb::NONE,
+            x11rb::CURRENT_TIME,
+        );
+        let _ = self.c.flush();
+    }
+
+    pub fn ungrab(&self) {
+        let _ = self.c.ungrab_pointer(x11rb::CURRENT_TIME);
+        let _ = self.c.flush();
     }
 }
 
