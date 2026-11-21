@@ -73,6 +73,8 @@ enum Hit {
     Item(usize),
     Header(SortKey),
     Content,
+    MenuItem(usize),
+    MenuOutside,
 }
 
 struct Metrics {
@@ -123,6 +125,59 @@ pub struct App {
     started: Instant,
     shown_once: bool,
     message: Option<(String, Instant)>,
+    error: bool,
+    worker: crate::ops::Worker,
+    rx: std::sync::mpsc::Receiver<crate::ops::Msg>,
+    wake: i32,
+    running: Option<Running>,
+    pending: usize,
+    undo: Vec<crate::ops::Undo>,
+    clip: Option<(Vec<PathBuf>, bool)>,
+    menu: Option<Menu>,
+    confirm: Option<Confirm>,
+    rename: Option<(usize, String)>,
+    select_after: Vec<PathBuf>,
+}
+
+struct Running {
+    verb: &'static str,
+    done: u64,
+    total: u64,
+    current: String,
+    cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Act {
+    Open,
+    OpenTab,
+    Cut,
+    Copy,
+    Paste,
+    Rename,
+    Trash,
+    Delete,
+    Restore,
+    EmptyTrash,
+    Extract,
+    PackZip,
+    PackTar,
+    NewFolder,
+    Terminal,
+    Hidden,
+    CopyPath,
+}
+
+struct Menu {
+    x: i32,
+    y: i32,
+    items: Vec<(String, Act, &'static str)>,
+    hover: Option<usize>,
+}
+
+struct Confirm {
+    text: String,
+    job: crate::ops::Job,
 }
 
 const DOUBLE_CLICK: Duration = Duration::from_millis(400);
@@ -141,6 +196,9 @@ impl App {
         let p = theme::load(&base, &theme_name);
         let _ = x.set_icon(&crate::logo::window_icons(&p));
         let inotify = unsafe { libc::inotify_init1(libc::IN_NONBLOCK | libc::IN_CLOEXEC) };
+        let wake = unsafe { libc::eventfd(0, libc::EFD_NONBLOCK | libc::EFD_CLOEXEC) };
+        let (tx, rx) = std::sync::mpsc::channel();
+        let worker = crate::ops::start(tx, wake);
         let mut app = App {
             cv: Canvas::new((1120.0 * s) as i32, (720.0 * s) as i32),
             icons: Icons::new(p.is_light()),
@@ -173,6 +231,18 @@ impl App {
             started,
             shown_once: false,
             message: None,
+            error: false,
+            worker,
+            rx,
+            wake,
+            running: None,
+            pending: 0,
+            undo: Vec::new(),
+            clip: None,
+            menu: None,
+            confirm: None,
+            rename: None,
+            select_after: Vec::new(),
         };
         app.load_tab(0, true);
         app.x.map()?;
@@ -588,14 +658,24 @@ impl App {
                     revents: 0,
                 },
                 libc::pollfd {
+                    fd: self.wake,
+                    events: libc::POLLIN,
+                    revents: 0,
+                },
+                libc::pollfd {
                     fd: self.inotify,
                     events: libc::POLLIN,
                     revents: 0,
                 },
             ];
-            let n = if self.inotify >= 0 { 2 } else { 1 };
+            let n = if self.inotify >= 0 { 3 } else { 2 };
             unsafe { libc::poll(fds.as_mut_ptr(), n, timeout) };
-            if n == 2 && fds[1].revents & libc::POLLIN != 0 {
+            if fds[1].revents & libc::POLLIN != 0 {
+                let mut v = 0u64;
+                unsafe { libc::read(self.wake, &mut v as *mut u64 as *mut libc::c_void, 8) };
+                self.worker_messages();
+            }
+            if n == 3 && fds[2].revents & libc::POLLIN != 0 {
                 self.drain_inotify();
             }
         }
@@ -621,6 +701,26 @@ impl App {
             Event::PropertyNotify(e) => {
                 if e.window == self.x.root && e.atom == self.x.atoms.niruwm_theme {
                     self.reload_theme();
+                }
+            }
+            Event::SelectionRequest(e) => {
+                if let Some((files, cut)) = self.clip.clone() {
+                    let _ = self.x.answer(&e, &files, cut);
+                }
+            }
+            Event::SelectionClear(_) => {}
+            Event::SelectionNotify(e) => self.pasted(e.target, e.property),
+            Event::MotionNotify(e) if self.menu.is_some() => {
+                let (x, y) = (e.event_x as i32, e.event_y as i32);
+                let h = match self.hit(x, y) {
+                    Some(Hit::MenuItem(i)) => Some(i),
+                    _ => None,
+                };
+                if let Some(m) = self.menu.as_mut() {
+                    if m.hover != h {
+                        m.hover = h;
+                        self.dirty = true;
+                    }
                 }
             }
             Event::MotionNotify(e) => {
@@ -658,6 +758,45 @@ impl App {
     fn button(&mut self, b: u8, x: i32, y: i32, state: KeyButMask) {
         let ctrl = state.contains(KeyButMask::CONTROL);
         let shift = state.contains(KeyButMask::SHIFT);
+        if self.confirm.is_some() {
+            return;
+        }
+        if self.menu.is_some() {
+            if let (1 | 3, Some(Hit::MenuItem(i))) = (b, self.hit(x, y)) {
+                let act = self
+                    .menu
+                    .as_ref()
+                    .and_then(|m| m.items.get(i))
+                    .map(|it| it.1);
+                self.menu = None;
+                if let Some(a) = act {
+                    self.act(a);
+                }
+            } else {
+                self.menu = None;
+            }
+            self.dirty = true;
+            return;
+        }
+        if self.rename.is_some() {
+            self.commit_rename();
+        }
+        if b == 3 {
+            match self.hit(x, y) {
+                Some(Hit::Item(i)) => {
+                    if !self.tab().selected.get(i).copied().unwrap_or(false) {
+                        self.set_cursor(i, false, false);
+                    }
+                    self.open_menu(x, y, true);
+                }
+                Some(Hit::Content) => {
+                    self.clear_selection();
+                    self.open_menu(x, y, false);
+                }
+                _ => {}
+            }
+            return;
+        }
         let step = self.m.row_h * 3;
         match b {
             4 | 5 => {
@@ -731,6 +870,40 @@ impl App {
         let ctrl = state.contains(KeyButMask::CONTROL);
         let shift = state.contains(KeyButMask::SHIFT);
         let alt = state.contains(KeyButMask::MOD1);
+        if self.confirm.is_some() {
+            match sym {
+                0xff0d | 0xff8d | 0x79 | 0x6a => {
+                    if let Some(c) = self.confirm.take() {
+                        self.submit(c.job);
+                    }
+                }
+                0xff1b | 0x6e => self.confirm = None,
+                _ => {}
+            }
+            self.dirty = true;
+            return;
+        }
+        if let Some(m) = self.menu.as_mut() {
+            let n = m.items.len();
+            match sym {
+                0xff1b => self.menu = None,
+                0xff52 => m.hover = Some(m.hover.map_or(n - 1, |h| (h + n - 1) % n)),
+                0xff54 => m.hover = Some(m.hover.map_or(0, |h| (h + 1) % n)),
+                0xff0d | 0xff8d => {
+                    let act = m.hover.and_then(|h| m.items.get(h)).map(|it| it.1);
+                    self.menu = None;
+                    if let Some(a) = act {
+                        self.act(a);
+                    }
+                }
+                _ => {}
+            }
+            self.dirty = true;
+            return;
+        }
+        if self.rename.is_some() {
+            return self.rename_key(sym, ctrl);
+        }
         if self.path_edit.is_some() {
             return self.path_key(sym, ctrl);
         }
@@ -744,9 +917,30 @@ impl App {
         // keysyms: X11/keysymdef.h
         match sym {
             0xff1b => {
-                // Escape
-                self.typed.clear();
-                self.clear_selection();
+                // Escape: cancel a running job, else clear the selection.
+                if let Some(r) = &self.running {
+                    r.cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+                    self.flash("Cancelling…".into());
+                } else {
+                    self.typed.clear();
+                    self.clear_selection();
+                }
+            }
+            0xffff => {
+                // Delete; Shift+Delete deletes permanently after asking.
+                if shift || self.in_trash() {
+                    self.act(Act::Delete);
+                } else {
+                    self.act(Act::Trash);
+                }
+            }
+            0xffbf => self.act(Act::Rename), // F2
+            0xff67 => {
+                // Menu key: the context menu at the cursor.
+                let c = self.tab().cursor;
+                let r = self.item_rect(c);
+                let any = !self.tab().shown.is_empty();
+                self.open_menu(r.x + r.w / 2, r.y + r.h / 2, any);
             }
             0xff0d | 0xff8d => {
                 if alt {
@@ -819,7 +1013,12 @@ impl App {
                 let a = self.active;
                 self.close_tab(a);
             }
-            0x71 => self.quit = true, // q
+            0x71 => self.quit = true,              // q
+            0x63 if !shift => self.act(Act::Copy), // c
+            0x63 => self.act(Act::CopyPath),       // Ctrl+Shift+C: the paths
+            0x78 => self.act(Act::Cut),            // x
+            0x76 => self.act(Act::Paste),          // v
+            0x7a => self.undo_last(),              // z
             0x68 => {
                 // h
                 self.hidden = !self.hidden;
@@ -842,22 +1041,7 @@ impl App {
                 let a = self.active;
                 self.load_tab(a, false);
             }
-            0x6e if shift => {
-                // Ctrl+Shift+N: new folder (prototype: named "New folder")
-                let mut p = self.tab().path.join("New folder");
-                let mut k = 2;
-                while p.exists() {
-                    p = self.tab().path.join(format!("New folder {k}"));
-                    k += 1;
-                }
-                match std::fs::create_dir(&p) {
-                    Ok(()) => self.flash(format!(
-                        "Created {}",
-                        p.file_name().unwrap_or_default().to_string_lossy()
-                    )),
-                    Err(e) => self.flash(format!("Could not create the folder: {e}")),
-                }
-            }
+            0x6e if shift => self.act(Act::NewFolder),
             _ => match sym {
                 0x31 => self.set_view(View::Icons), // 1
                 0x32 => self.set_view(View::List),  // 2
@@ -1013,6 +1197,9 @@ impl App {
         }
         self.draw_content();
         self.draw_status();
+        self.draw_rename();
+        self.draw_menu();
+        self.draw_confirm();
     }
 
     fn draw_sidebar(&mut self) {
@@ -1512,7 +1699,10 @@ impl App {
         let ty = track.y
             + ((track.h - th) as i64 * self.tab().scroll as i64 / (total - c.h).max(1) as i64)
                 as i32;
-        self.cv.fill(Rect::new(track.x, ty, w, th), blend(self.p.border, self.p.muted, 0.5));
+        self.cv.fill(
+            Rect::new(track.x, ty, w, th),
+            blend(self.p.border, self.p.muted, 0.5),
+        );
     }
 
     fn draw_status(&mut self) {
@@ -1547,9 +1737,33 @@ impl App {
         }
         let ty = r.y + (status_h - small.height) / 2;
         let msg = self.message.as_ref().map(|(m, _)| m.clone());
-        if let Some(m) = msg {
-            self.text
-                .draw(&mut self.cv, r.x + pad, ty, &m, small, p.accent);
+        if let Some(run) = &self.running {
+            // Progress: a pixel bar and the item being worked on.
+            let pct = (run.done * 100)
+                .checked_div(run.total)
+                .unwrap_or(0)
+                .min(100);
+            let label = format!("{} {pct}% · {} · Esc cancels", run.verb, run.current);
+            let bw = (120.0 * self.m.s) as i32;
+            let bh = (small.height / 2).max(4);
+            let by = r.y + (status_h - bh) / 2;
+            self.cv.fill(Rect::new(r.x + pad, by, bw, bh), p.border);
+            self.cv.fill(
+                Rect::new(r.x + pad, by, (bw as u64 * pct / 100) as i32, bh),
+                p.accent,
+            );
+            let label = self.text.ellipsize(&label, small, r.w / 2);
+            self.text.draw(
+                &mut self.cv,
+                r.x + 2 * pad + bw,
+                ty,
+                &label,
+                small,
+                p.foreground,
+            );
+        } else if let Some(m) = msg {
+            let col = if self.error { p.error } else { p.accent };
+            self.text.draw(&mut self.cv, r.x + pad, ty, &m, small, col);
         } else if !self.typed.is_empty() && self.typed_at.elapsed() < Duration::from_millis(900) {
             let s = format!("find: {}", self.typed);
             self.text
@@ -1571,6 +1785,628 @@ impl App {
             small,
             p.border,
         );
+    }
+}
+
+impl App {
+    fn selection_paths(&self) -> Vec<PathBuf> {
+        let t = self.tab();
+        let v: Vec<PathBuf> = t
+            .selected
+            .iter()
+            .enumerate()
+            .filter(|(_, s)| **s)
+            .filter_map(|(i, _)| t.entry(i).map(|e| e.path.clone()))
+            .collect();
+        if v.is_empty() {
+            t.entry(t.cursor)
+                .filter(|_| !t.shown.is_empty())
+                .map(|e| vec![e.path.clone()])
+                .unwrap_or_default()
+        } else {
+            v
+        }
+    }
+
+    fn in_trash(&self) -> bool {
+        self.tab().path.starts_with(places::trash_files())
+    }
+
+    fn submit(&mut self, job: crate::ops::Job) {
+        let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        if self.running.is_none() {
+            self.running = Some(Running {
+                verb: job.verb(),
+                done: 0,
+                total: 0,
+                current: String::new(),
+                cancel: cancel.clone(),
+            });
+        }
+        self.pending += 1;
+        let _ = self.worker.tx.send((job, cancel));
+        self.dirty = true;
+    }
+
+    fn worker_messages(&mut self) {
+        while let Ok(m) = self.rx.try_recv() {
+            match m {
+                crate::ops::Msg::Progress {
+                    done,
+                    total,
+                    current,
+                } => {
+                    if let Some(r) = self.running.as_mut() {
+                        r.done = done;
+                        r.total = total;
+                        r.current = current;
+                    }
+                }
+                crate::ops::Msg::Done {
+                    summary,
+                    undo,
+                    errors,
+                    created,
+                } => {
+                    self.pending = self.pending.saturating_sub(1);
+                    if self.pending == 0 {
+                        self.running = None;
+                    }
+                    if let Some(u) = undo {
+                        self.undo.push(u);
+                        if self.undo.len() > 50 {
+                            self.undo.remove(0);
+                        }
+                    }
+                    self.select_after = created;
+                    if let Some(first) = errors.first() {
+                        let more = if errors.len() > 1 {
+                            format!(" (+{} more)", errors.len() - 1)
+                        } else {
+                            String::new()
+                        };
+                        self.flash_error(format!("{first}{more}"));
+                    } else {
+                        self.flash(summary);
+                    }
+                    let a = self.active;
+                    self.load_tab(a, false);
+                    self.apply_select_after();
+                }
+            }
+        }
+        self.dirty = true;
+    }
+
+    fn apply_select_after(&mut self) {
+        if self.select_after.is_empty() {
+            return;
+        }
+        let want = std::mem::take(&mut self.select_after);
+        let t = self.tab_mut();
+        let mut first = None;
+        for (k, idx) in t.shown.iter().enumerate() {
+            let hit = want.contains(&t.all[*idx].path);
+            t.selected[k] = hit;
+            if hit && first.is_none() {
+                first = Some(k);
+            }
+        }
+        if let Some(f) = first {
+            t.cursor = f;
+            t.anchor = f;
+            self.reveal();
+        }
+    }
+
+    fn flash_error(&mut self, s: String) {
+        self.message = Some((s, Instant::now()));
+        self.error = true;
+        self.dirty = true;
+    }
+
+    fn act(&mut self, a: Act) {
+        self.error = false;
+        let here = self.tab().path.clone();
+        let sel = self.selection_paths();
+        match a {
+            Act::Open => self.open_selection(),
+            Act::OpenTab => {
+                for p in sel.into_iter().filter(|p| p.is_dir()) {
+                    self.new_tab(p);
+                }
+            }
+            Act::Copy | Act::Cut => {
+                if sel.is_empty() {
+                    return;
+                }
+                let cut = a == Act::Cut;
+                let n = sel.len();
+                self.clip = Some((sel, cut));
+                let _ = self.x.own_clipboard();
+                self.flash(format!(
+                    "{} {n} item{}",
+                    if cut { "Cut" } else { "Copied" },
+                    if n == 1 { "" } else { "s" }
+                ));
+            }
+            Act::CopyPath => {
+                if sel.is_empty() {
+                    return;
+                }
+                // Paths as text for a terminal; pasting here still copies.
+                self.clip = Some((sel, false));
+                let _ = self.x.own_clipboard();
+                self.flash("Copied the paths".into());
+            }
+            Act::Paste => {
+                if self.x.owns_clipboard() {
+                    if let Some((files, cut)) = self.clip.clone() {
+                        self.paste_files(files, cut);
+                    }
+                } else {
+                    let _ = self.x.request_clipboard(self.x.atoms.gnome_copied);
+                }
+            }
+            Act::Rename => {
+                let t = self.tab();
+                if let Some(e) = t.entry(t.cursor) {
+                    let name = e.name.clone();
+                    let c = t.cursor;
+                    self.rename = Some((c, name));
+                    self.dirty = true;
+                }
+            }
+            Act::Trash => {
+                if sel.is_empty() {
+                    return;
+                }
+                self.submit(crate::ops::Job::Trash { paths: sel });
+            }
+            Act::Delete => {
+                if sel.is_empty() {
+                    return;
+                }
+                let n = sel.len();
+                let what = if n == 1 {
+                    format!(
+                        "\"{}\"",
+                        sel[0].file_name().unwrap_or_default().to_string_lossy()
+                    )
+                } else {
+                    format!("{n} items")
+                };
+                self.confirm = Some(Confirm {
+                    text: format!("Delete {what} permanently? It cannot be undone.  Enter: delete · Esc: keep"),
+                    job: crate::ops::Job::Delete { paths: sel },
+                });
+                self.dirty = true;
+            }
+            Act::Restore => {
+                let pairs: Vec<_> = sel
+                    .iter()
+                    .filter_map(|f| {
+                        crate::ops::trash_origin(f).map(|(info, orig)| (f.clone(), info, orig))
+                    })
+                    .collect();
+                if !pairs.is_empty() {
+                    self.submit(crate::ops::Job::Restore { pairs });
+                }
+            }
+            Act::EmptyTrash => {
+                self.confirm = Some(Confirm {
+                    text: "Empty the trash? Everything in it is deleted for good.  Enter: empty · Esc: keep".into(),
+                    job: crate::ops::Job::Delete {
+                        // The files and their .trashinfo records together.
+                        paths: ["files", "info"]
+                            .iter()
+                            .filter_map(|d| std::fs::read_dir(places::trash_files().with_file_name(d)).ok())
+                            .flat_map(|rd| rd.flatten().map(|e| e.path()))
+                            .collect(),
+                    },
+                });
+                self.dirty = true;
+            }
+            Act::Extract => {
+                for p in sel
+                    .into_iter()
+                    .filter(|p| crate::archive::is_archive(&p.to_string_lossy()))
+                {
+                    self.submit(crate::ops::Job::Extract {
+                        archive: p,
+                        dst: here.clone(),
+                    });
+                }
+            }
+            Act::PackZip | Act::PackTar => {
+                if sel.is_empty() {
+                    return;
+                }
+                let ext = if a == Act::PackZip { ".zip" } else { ".tar.gz" };
+                let base = if sel.len() == 1 {
+                    let n = sel[0]
+                        .file_name()
+                        .unwrap_or_default()
+                        .to_string_lossy()
+                        .into_owned();
+                    crate::ops::split_ext(&n, sel[0].is_dir()).0
+                } else {
+                    here.file_name()
+                        .map(|n| n.to_string_lossy().into_owned())
+                        .unwrap_or_else(|| "archive".into())
+                };
+                let out = crate::ops::free_name(&here, Path::new(&format!("{base}{ext}")));
+                self.submit(crate::ops::Job::Compress { paths: sel, out });
+            }
+            Act::NewFolder => {
+                let p = crate::ops::free_name(&here, Path::new("New folder"));
+                match std::fs::create_dir(&p) {
+                    Ok(()) => {
+                        self.undo
+                            .push(crate::ops::Undo::TrashCreated(vec![p.clone()]));
+                        let a = self.active;
+                        self.load_tab(a, false);
+                        self.select_after = vec![p];
+                        self.apply_select_after();
+                        self.act(Act::Rename);
+                    }
+                    Err(e) => self.flash_error(format!("Could not create the folder: {e}")),
+                }
+            }
+            Act::Terminal => spawn(
+                "kitty",
+                &[std::ffi::OsStr::new("--directory"), here.as_os_str()],
+                Some(&here),
+            ),
+            Act::Hidden => {
+                self.hidden = !self.hidden;
+                let a = self.active;
+                self.load_tab(a, false);
+            }
+        }
+    }
+
+    fn paste_files(&mut self, files: Vec<PathBuf>, cut: bool) {
+        let files: Vec<PathBuf> = files
+            .into_iter()
+            .filter(|p| std::fs::symlink_metadata(p).is_ok())
+            .collect();
+        if files.is_empty() {
+            self.flash_error("Nothing to paste".into());
+            return;
+        }
+        let dst = self.tab().path.clone();
+        if cut {
+            self.clip = None;
+            self.submit(crate::ops::Job::Move { srcs: files, dst });
+        } else {
+            self.submit(crate::ops::Job::Copy { srcs: files, dst });
+        }
+    }
+
+    /// The answer to our clipboard request from another program.
+    fn pasted(&mut self, target: u32, property: u32) {
+        let a = &self.x.atoms;
+        if property == x11rb::NONE {
+            // No files in that format: try the plain URI list once.
+            if target == a.gnome_copied {
+                let _ = self.x.request_clipboard(a.uri_list);
+            } else {
+                self.flash_error("The clipboard has no files".into());
+            }
+            return;
+        }
+        let Some(data) = self.x.take_selection() else {
+            return;
+        };
+        let (files, cut) = crate::x::parse_uris(&data);
+        self.paste_files(files, cut);
+    }
+
+    fn undo_last(&mut self) {
+        let Some(u) = self.undo.pop() else {
+            self.flash("Nothing to undo".into());
+            return;
+        };
+        match u {
+            crate::ops::Undo::MoveBack(pairs) => {
+                // Each item goes back to its own folder.
+                let mut n = 0;
+                for (now, orig) in pairs {
+                    if std::fs::symlink_metadata(&orig).is_err()
+                        && std::fs::rename(&now, &orig).is_ok()
+                    {
+                        n += 1;
+                    }
+                }
+                self.flash(format!(
+                    "Undone: {n} item{} moved back",
+                    if n == 1 { "" } else { "s" }
+                ));
+                let a = self.active;
+                self.load_tab(a, false);
+            }
+            crate::ops::Undo::Untrash(v) => self.submit(crate::ops::Job::Restore { pairs: v }),
+            crate::ops::Undo::TrashCreated(v) => {
+                let v: Vec<PathBuf> = v
+                    .into_iter()
+                    .filter(|p| std::fs::symlink_metadata(p).is_ok())
+                    .collect();
+                if !v.is_empty() {
+                    self.submit(crate::ops::Job::Trash { paths: v });
+                }
+            }
+        }
+    }
+
+    fn rename_key(&mut self, sym: u32, ctrl: bool) {
+        let Some((_, buf)) = self.rename.as_mut() else {
+            return;
+        };
+        match sym {
+            0xff1b => self.rename = None,
+            0xff0d | 0xff8d => self.commit_rename(),
+            0xff08 => {
+                if ctrl {
+                    buf.clear();
+                } else {
+                    buf.pop();
+                }
+            }
+            _ => {
+                if let Some(c) = keysym_char(sym) {
+                    if !c.is_control() && c != '/' {
+                        buf.push(c);
+                    }
+                }
+            }
+        }
+        self.dirty = true;
+    }
+
+    fn commit_rename(&mut self) {
+        let Some((i, name)) = self.rename.take() else {
+            return;
+        };
+        self.dirty = true;
+        let Some(e) = self.tab().entry(i).cloned() else {
+            return;
+        };
+        let name = name.trim().to_string();
+        if name.is_empty() || name == e.name || name == "." || name == ".." {
+            return;
+        }
+        let target = e.path.with_file_name(&name);
+        if std::fs::symlink_metadata(&target).is_ok() {
+            self.flash_error(format!("\"{name}\" already exists"));
+            return;
+        }
+        match std::fs::rename(&e.path, &target) {
+            Ok(()) => {
+                self.undo.push(crate::ops::Undo::MoveBack(vec![(
+                    target.clone(),
+                    e.path.clone(),
+                )]));
+                let a = self.active;
+                self.load_tab(a, false);
+                self.select_after = vec![target];
+                self.apply_select_after();
+            }
+            Err(err) => self.flash_error(format!("Could not rename: {err}")),
+        }
+    }
+
+    fn open_menu(&mut self, x: i32, y: i32, on_items: bool) {
+        let sel = self.selection_paths();
+        let mut items: Vec<(String, Act, &'static str)> = Vec::new();
+        let trash = self.in_trash();
+        if on_items && !sel.is_empty() {
+            items.push(("Open".into(), Act::Open, "Enter"));
+            if sel.iter().any(|p| p.is_dir()) {
+                items.push(("Open in a new tab".into(), Act::OpenTab, ""));
+            }
+            if trash {
+                items.push(("Restore".into(), Act::Restore, ""));
+                items.push(("Delete permanently".into(), Act::Delete, "Del"));
+            } else {
+                items.push(("Cut".into(), Act::Cut, "Ctrl+X"));
+                items.push(("Copy".into(), Act::Copy, "Ctrl+C"));
+                items.push(("Copy path".into(), Act::CopyPath, "Ctrl+Shift+C"));
+                if sel.len() == 1 {
+                    items.push(("Rename".into(), Act::Rename, "F2"));
+                }
+                if sel
+                    .iter()
+                    .any(|p| crate::archive::is_archive(&p.to_string_lossy()))
+                {
+                    items.push(("Unpack here".into(), Act::Extract, ""));
+                }
+                items.push(("Pack as .zip".into(), Act::PackZip, ""));
+                items.push(("Pack as .tar.gz".into(), Act::PackTar, ""));
+                items.push(("Move to the trash".into(), Act::Trash, "Del"));
+                items.push(("Delete permanently".into(), Act::Delete, "Shift+Del"));
+            }
+        } else {
+            if !trash {
+                items.push(("Paste".into(), Act::Paste, "Ctrl+V"));
+                items.push(("New folder".into(), Act::NewFolder, "Ctrl+Shift+N"));
+            } else {
+                items.push(("Empty the trash".into(), Act::EmptyTrash, ""));
+            }
+            items.push(("Terminal here".into(), Act::Terminal, "F4"));
+            items.push((
+                if self.hidden {
+                    "Hide hidden files"
+                } else {
+                    "Show hidden files"
+                }
+                .into(),
+                Act::Hidden,
+                "Ctrl+H",
+            ));
+        }
+        self.menu = Some(Menu {
+            x,
+            y,
+            items,
+            hover: None,
+        });
+        self.dirty = true;
+    }
+
+    fn draw_menu(&mut self) {
+        let Some(m) = self.menu.as_ref() else { return };
+        let p = self.p;
+        let (font, small, pad) = (self.m.font, self.m.small, self.m.pad);
+        let items = m.items.clone();
+        let hover = m.hover;
+        let row = font.height + pad;
+        let label_w = items
+            .iter()
+            .map(|it| self.text.width(&it.0, font))
+            .max()
+            .unwrap_or(0);
+        let key_w = items
+            .iter()
+            .map(|it| self.text.width(it.2, small))
+            .max()
+            .unwrap_or(0);
+        let w = label_w + key_w + 5 * pad;
+        let h = row * items.len() as i32 + pad;
+        let x = m.x.min(self.cv.w - w - 2).max(0);
+        let y = if m.y + h > self.cv.h {
+            (m.y - h).max(0)
+        } else {
+            m.y
+        };
+        let r = Rect::new(x, y, w, h);
+        self.hits
+            .push((Rect::new(0, 0, self.cv.w, self.cv.h), Hit::MenuOutside));
+        // A hard pixel shadow, the retro way.
+        let sh = (3.0 * self.m.s) as i32;
+        self.cv
+            .tint(Rect::new(r.x + sh, r.y + sh, r.w, r.h), 0x000000, 110);
+        self.cv.fill(r, p.surface);
+        self.cv.frame(r, p.border);
+        for (i, (label, _, key)) in items.iter().enumerate() {
+            let ir = Rect::new(r.x + 1, r.y + pad / 2 + i as i32 * row, r.w - 2, row);
+            if hover == Some(i) {
+                self.cv.fill(ir, p.selected);
+                self.cv.fill(
+                    Rect::new(ir.x, ir.y, (2.0 * self.m.s).max(2.0) as i32, ir.h),
+                    p.accent,
+                );
+            }
+            let danger = label.starts_with("Delete") || label.starts_with("Empty");
+            let col = if danger { p.error } else { p.foreground };
+            self.text.draw(
+                &mut self.cv,
+                ir.x + 2 * pad,
+                ir.y + (row - font.height) / 2,
+                label,
+                font,
+                col,
+            );
+            let kw = self.text.width(key, small);
+            self.text.draw(
+                &mut self.cv,
+                ir.x + ir.w - kw - pad * 2,
+                ir.y + (row - small.height) / 2,
+                key,
+                small,
+                p.muted,
+            );
+            self.hits.push((ir, Hit::MenuItem(i)));
+        }
+    }
+
+    fn draw_confirm(&mut self) {
+        let Some(c) = self.confirm.as_ref() else {
+            return;
+        };
+        let p = self.p;
+        let text = c.text.clone();
+        let (font, pad) = (self.m.font, self.m.pad);
+        let (main, keys) = text.split_once("  ").unwrap_or((&text, ""));
+        let (main, keys) = (main.to_string(), keys.to_string());
+        let w = (self
+            .text
+            .width(&main, font)
+            .max(self.text.width(&keys, font))
+            + 6 * pad)
+            .min(self.cv.w - 4 * pad);
+        let h = 2 * font.height + 5 * pad;
+        let r = Rect::new((self.cv.w - w) / 2, (self.cv.h - h) / 2, w, h);
+        self.cv
+            .tint(Rect::new(0, 0, self.cv.w, self.cv.h), p.background, 140);
+        let sh = (4.0 * self.m.s) as i32;
+        self.cv
+            .tint(Rect::new(r.x + sh, r.y + sh, r.w, r.h), 0x000000, 120);
+        self.cv.fill(r, p.surface);
+        self.cv.frame(r, p.error);
+        let main = self.text.ellipsize(&main, font, w - 4 * pad);
+        self.text.draw(
+            &mut self.cv,
+            r.x + 3 * pad,
+            r.y + 2 * pad,
+            &main,
+            font,
+            p.foreground,
+        );
+        self.text.draw(
+            &mut self.cv,
+            r.x + 3 * pad,
+            r.y + 3 * pad + font.height,
+            &keys,
+            font,
+            p.muted,
+        );
+    }
+
+    /// The rename field over an item's label.
+    fn draw_rename(&mut self) {
+        let Some((i, buf)) = self.rename.clone() else {
+            return;
+        };
+        let p = self.p;
+        let (font, pad, icon) = (self.m.font, self.m.pad, self.m.icon);
+        let r = self.item_rect(i);
+        let fr = match self.view {
+            View::Icons => Rect::new(
+                r.x - pad,
+                r.y + pad + icon + pad / 4,
+                r.w + 2 * pad,
+                font.height + pad / 2,
+            ),
+            View::List => Rect::new(
+                r.x + 2 * pad + self.m.small_icon - pad / 2,
+                r.y + 1,
+                r.w / 2,
+                r.h - 2,
+            ),
+        };
+        let fr = Rect::new(
+            fr.x.max(self.content.x),
+            fr.y,
+            fr.w.min(self.content.x + self.content.w - fr.x.max(self.content.x)),
+            fr.h,
+        );
+        self.cv.set_clip(self.content);
+        self.cv.fill(fr, p.background);
+        self.cv.frame(fr, p.accent);
+        let shown = format!("{buf}▏");
+        let tw = self.text.width(&shown, font);
+        let start = (tw - (fr.w - 2 * pad / 2)).max(0);
+        self.cv.set_clip(fr.inset(1).intersect(&self.content));
+        self.text.draw(
+            &mut self.cv,
+            fr.x + pad / 2 - start,
+            fr.y + (fr.h - font.height) / 2,
+            &shown,
+            font,
+            p.foreground,
+        );
+        self.cv.reset_clip();
     }
 }
 

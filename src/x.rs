@@ -18,6 +18,11 @@ pub struct Atoms {
     pub net_wm_pid: Atom,
     pub utf8: Atom,
     pub niruwm_theme: Atom,
+    pub clipboard: Atom,
+    pub targets: Atom,
+    pub uri_list: Atom,
+    pub gnome_copied: Atom,
+    pub sel_prop: Atom,
 }
 
 struct Shm {
@@ -59,6 +64,11 @@ impl X {
             net_wm_pid: atom(&c, "_NET_WM_PID")?,
             utf8: atom(&c, "UTF8_STRING")?,
             niruwm_theme: atom(&c, "_NIRUWM_THEME")?,
+            clipboard: atom(&c, "CLIPBOARD")?,
+            targets: atom(&c, "TARGETS")?,
+            uri_list: atom(&c, "text/uri-list")?,
+            gnome_copied: atom(&c, "x-special/gnome-copied-files")?,
+            sel_prop: atom(&c, "_NIRUFM_SELECTION")?,
         };
         let win = c.generate_id()?;
         c.create_window(
@@ -337,6 +347,164 @@ impl X {
         self.c.get_input_focus()?.reply()?;
         Ok(())
     }
+}
+
+impl X {
+    /// Take the CLIPBOARD so other programs can paste our files.
+    pub fn own_clipboard(&self) -> Res<()> {
+        self.c
+            .set_selection_owner(self.win, self.atoms.clipboard, x11rb::CURRENT_TIME)?;
+        Ok(())
+    }
+
+    pub fn owns_clipboard(&self) -> bool {
+        self.c
+            .get_selection_owner(self.atoms.clipboard)
+            .ok()
+            .and_then(|c| c.reply().ok())
+            .is_some_and(|r| r.owner == self.win)
+    }
+
+    /// Ask the clipboard owner for files; the answer is a SelectionNotify.
+    pub fn request_clipboard(&self, target: Atom) -> Res<()> {
+        self.c.convert_selection(
+            self.win,
+            self.atoms.clipboard,
+            target,
+            self.atoms.sel_prop,
+            x11rb::CURRENT_TIME,
+        )?;
+        self.c.flush()?;
+        Ok(())
+    }
+
+    pub fn take_selection(&self) -> Option<Vec<u8>> {
+        let r = self
+            .c
+            .get_property(
+                true,
+                self.win,
+                self.atoms.sel_prop,
+                AtomEnum::ANY,
+                0,
+                1 << 24,
+            )
+            .ok()?
+            .reply()
+            .ok()?;
+        (!r.value.is_empty()).then_some(r.value)
+    }
+
+    /// Answer another program's paste request with `files` (cut or copy).
+    pub fn answer(
+        &self,
+        e: &SelectionRequestEvent,
+        files: &[std::path::PathBuf],
+        cut: bool,
+    ) -> Res<()> {
+        let a = &self.atoms;
+        let uris: Vec<String> = files.iter().map(|p| file_uri(p)).collect();
+        let mut prop = if e.property == x11rb::NONE {
+            e.target
+        } else {
+            e.property
+        };
+        if e.target == a.targets {
+            let t = [
+                a.targets,
+                a.gnome_copied,
+                a.uri_list,
+                a.utf8,
+                u32::from(AtomEnum::STRING),
+            ];
+            self.c
+                .change_property32(PropMode::REPLACE, e.requestor, prop, AtomEnum::ATOM, &t)?;
+        } else if e.target == a.gnome_copied {
+            let body = format!("{}\n{}", if cut { "cut" } else { "copy" }, uris.join("\n"));
+            self.c.change_property8(
+                PropMode::REPLACE,
+                e.requestor,
+                prop,
+                e.target,
+                body.as_bytes(),
+            )?;
+        } else if e.target == a.uri_list {
+            let body = uris.iter().map(|u| format!("{u}\r\n")).collect::<String>();
+            self.c.change_property8(
+                PropMode::REPLACE,
+                e.requestor,
+                prop,
+                e.target,
+                body.as_bytes(),
+            )?;
+        } else if e.target == a.utf8 || e.target == u32::from(AtomEnum::STRING) {
+            let body = files
+                .iter()
+                .map(|p| p.display().to_string())
+                .collect::<Vec<_>>()
+                .join("\n");
+            self.c.change_property8(
+                PropMode::REPLACE,
+                e.requestor,
+                prop,
+                e.target,
+                body.as_bytes(),
+            )?;
+        } else {
+            prop = x11rb::NONE;
+        }
+        let ev = SelectionNotifyEvent {
+            response_type: SELECTION_NOTIFY_EVENT,
+            sequence: 0,
+            time: e.time,
+            requestor: e.requestor,
+            selection: e.selection,
+            target: e.target,
+            property: prop,
+        };
+        self.c
+            .send_event(false, e.requestor, EventMask::NO_EVENT, ev)?;
+        self.c.flush()?;
+        Ok(())
+    }
+}
+
+pub fn file_uri(p: &std::path::Path) -> String {
+    use std::os::unix::ffi::OsStrExt;
+    let mut s = String::from("file://");
+    for &b in p.as_os_str().as_bytes() {
+        if b.is_ascii_alphanumeric() || b"/-_.~".contains(&b) {
+            s.push(b as char);
+        } else {
+            s.push_str(&format!("%{b:02X}"));
+        }
+    }
+    s
+}
+
+/// Paths from text/uri-list or gnome-copied-files ("copy" or "cut" first).
+pub fn parse_uris(data: &[u8]) -> (Vec<std::path::PathBuf>, bool) {
+    let text = String::from_utf8_lossy(data);
+    let mut cut = false;
+    let mut v = Vec::new();
+    for (i, line) in text.lines().enumerate() {
+        let line = line.trim();
+        if i == 0 && (line == "cut" || line == "copy") {
+            cut = line == "cut";
+            continue;
+        }
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        if let Some(rest) = line.strip_prefix("file://") {
+            // file://host/path: the host part is empty or localhost.
+            let rest = rest.strip_prefix("localhost").unwrap_or(rest);
+            v.push(crate::ops::decode_path(rest));
+        } else if line.starts_with('/') {
+            v.push(std::path::PathBuf::from(line));
+        }
+    }
+    (v, cut)
 }
 
 impl Drop for X {

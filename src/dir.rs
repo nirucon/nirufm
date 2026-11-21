@@ -50,7 +50,16 @@ pub fn read(path: &Path, mime: &crate::mime::Mime) -> std::io::Result<Vec<Entry>
         } else {
             mime.for_name(&name).to_string()
         };
-        let label: String = name.chars().map(|c| if c.is_control() || c == '\u{fffd}' { '?' } else { c }).collect();
+        let label: String = name
+            .chars()
+            .map(|c| {
+                if c.is_control() || c == '\u{fffd}' {
+                    '?'
+                } else {
+                    c
+                }
+            })
+            .collect();
         out.push(Entry {
             label,
             name,

@@ -1,10 +1,12 @@
 //! NIRUFM: a fast, light file manager for the NIRU suite.
 mod app;
+mod archive;
 mod canvas;
 mod dir;
 mod icons;
 mod logo;
 mod mime;
+mod ops;
 mod places;
 mod text;
 mod theme;
