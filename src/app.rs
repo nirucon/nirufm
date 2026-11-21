@@ -19,7 +19,29 @@ use x11rb::wrapper::ConnectionExt as _;
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum View {
     Icons,
+    Thumbs,
+    Compact,
     List,
+}
+
+impl View {
+    pub fn name(self) -> &'static str {
+        match self {
+            View::Icons => "icons",
+            View::Thumbs => "thumbnails",
+            View::Compact => "compact",
+            View::List => "list",
+        }
+    }
+    pub fn from_name(s: &str) -> Option<View> {
+        Some(match s {
+            "icons" => View::Icons,
+            "thumbnails" => View::Thumbs,
+            "compact" => View::Compact,
+            "list" => View::List,
+            _ => return None,
+        })
+    }
 }
 
 struct Tab {
@@ -73,6 +95,7 @@ enum Hit {
     Up,
     Item(usize),
     Header(SortKey),
+    View(View),
     Content,
     MenuItem(usize),
     Eject(usize),
@@ -161,6 +184,8 @@ pub struct App {
     drag_in: Option<DragIn>,
     drop_target: Option<DropAt>,
     dropped_files: Option<Vec<PathBuf>>,
+    /// Remembered view per folder: view, zoom, sort, reverse.
+    folders: std::collections::HashMap<PathBuf, (View, usize, SortKey, bool)>,
 }
 
 /// Files being dragged out of this window.
@@ -374,6 +399,7 @@ impl App {
             drag_in: None,
             drop_target: None,
             dropped_files: None,
+            folders: load_folders(),
         };
         app.load_tab(0, true);
         app.x.map()?;
@@ -412,6 +438,9 @@ impl App {
         if reset {
             self.thumbs.clear();
             self.thumb_img.clear();
+            if i == self.active {
+                self.apply_memory(&path);
+            }
         }
         let (all, error) = match dir::read(&path, &self.mime) {
             Ok(mut v) => {
@@ -589,6 +618,8 @@ impl App {
     fn switch(&mut self, i: usize) {
         if i < self.tabs.len() && i != self.active {
             self.active = i;
+            let p = self.tabs[i].path.clone();
+            self.apply_memory(&p);
             let a = self.active;
             self.load_tab(a, false);
         }
@@ -689,36 +720,66 @@ impl App {
         self.dirty = true;
     }
 
+    /// Cell width, cell height and picture size of the grid views.
+    fn grid(&self) -> (i32, i32, i32) {
+        let m = &self.m;
+        match self.view {
+            View::Thumbs => {
+                let b = self.thumb_box();
+                (b + 2 * m.pad, b + m.font.height + 2 * m.pad + m.pad / 2, b)
+            }
+            View::Compact => ((240.0 * m.s) as i32, m.row_h, m.small_icon),
+            _ => (m.cell_w, m.cell_h, m.icon),
+        }
+    }
+
+    /// The picture size of the thumbnail view (follows the zoom).
+    fn thumb_box(&self) -> i32 {
+        ((self.m.icon as f32 * 2.2) as i32)
+            .clamp((96.0 * self.m.s) as i32, (360.0 * self.m.s) as i32)
+    }
+
+    /// The size thumbnails are drawn at in the current view.
+    fn picture_size(&self) -> i32 {
+        match self.view {
+            View::Thumbs => self.thumb_box(),
+            View::Compact | View::List => 0,
+            View::Icons => self.m.icon,
+        }
+    }
+
     fn item_rect(&self, i: usize) -> Rect {
         let c = self.content;
         match self.view {
-            View::Icons => {
-                let cols = self.cols.max(1);
-                let (col, row) = (i as i32 % cols, i as i32 / cols);
-                Rect::new(
-                    c.x + self.m.pad + col * self.m.cell_w,
-                    c.y + self.m.pad + row * self.m.cell_h - self.tab().scroll,
-                    self.m.cell_w,
-                    self.m.cell_h,
-                )
-            }
             View::List => Rect::new(
                 c.x,
                 c.y + self.m.row_h + i as i32 * self.m.row_h - self.tab().scroll,
                 c.w,
                 self.m.row_h,
             ),
+            _ => {
+                let (cw, ch, _) = self.grid();
+                let cols = self.cols.max(1);
+                let (col, row) = (i as i32 % cols, i as i32 / cols);
+                Rect::new(
+                    c.x + self.m.pad + col * cw,
+                    c.y + self.m.pad + row * ch - self.tab().scroll,
+                    cw,
+                    ch,
+                )
+            }
         }
     }
 
     fn content_height(&self) -> i32 {
         let n = self.tab().shown.len() as i32;
         match self.view {
-            View::Icons => {
-                let rows = (n + self.cols.max(1) - 1) / self.cols.max(1);
-                rows * self.m.cell_h + 2 * self.m.pad
-            }
             View::List => (n + 1) * self.m.row_h,
+            _ => {
+                let (_, ch, _) = self.grid();
+                let rows = (n + self.cols.max(1) - 1) / self.cols.max(1);
+                rows * ch + 2 * self.m.pad
+            }
         }
     }
 
@@ -749,8 +810,8 @@ impl App {
 
     fn page(&self) -> usize {
         match self.view {
-            View::Icons => ((self.content.h / self.m.cell_h).max(1) * self.cols.max(1)) as usize,
             View::List => (self.content.h / self.m.row_h - 1).max(1) as usize,
+            _ => ((self.content.h / self.grid().1).max(1) * self.cols.max(1)) as usize,
         }
     }
 
@@ -1110,6 +1171,7 @@ impl App {
             (1, Hit::Crumb(p)) => self.go(p),
             (2, Hit::Crumb(p)) => self.new_tab(p),
             (1, Hit::Back) => self.back(),
+            (1, Hit::View(v)) => self.set_view(v),
             (1, Hit::Forward) => self.forward(),
             (1, Hit::Up) => self.up(),
             (1, Hit::Header(k)) => {
@@ -1119,6 +1181,7 @@ impl App {
                     self.sort = k;
                     self.reverse = false;
                 }
+                self.remember_folder();
                 let a = self.active;
                 self.load_tab(a, false);
             }
@@ -1206,7 +1269,7 @@ impl App {
         }
         let t = self.tab();
         let (cur, n) = (t.cursor, t.shown.len());
-        let cols = if self.view == View::Icons {
+        let cols = if self.view != View::List {
             self.cols.max(1) as usize
         } else {
             1
@@ -1351,8 +1414,10 @@ impl App {
                 0x2b | 0x3d | 0xffab => self.set_zoom(self.zoom + 1), // + = KP_Add
                 0x2d | 0xffad => self.set_zoom(self.zoom.saturating_sub(1)), // - KP_Subtract
                 0x30 => self.set_zoom(ZOOM_DEFAULT),
-                0x31 => self.set_view(View::Icons), // 1
-                0x32 => self.set_view(View::List),  // 2
+                0x31 => self.set_view(View::Icons),   // 1
+                0x32 => self.set_view(View::Thumbs),  // 2
+                0x33 => self.set_view(View::Compact), // 3
+                0x34 => self.set_view(View::List),    // 4
                 0xff56 => {
                     let k = self.tabs.len();
                     self.switch((self.active + 1) % k)
@@ -1370,9 +1435,12 @@ impl App {
         if self.view != v {
             self.view = v;
             self.tab_mut().scroll = 0;
+            self.thumbs.clear();
+            self.thumb_img.clear();
             self.dirty = true;
             self.layout_only();
             self.reveal();
+            self.remember_folder();
         }
     }
 
@@ -1487,7 +1555,9 @@ impl App {
             self.cv.w - m.side_w - 1,
             self.cv.h - top - m.status_h,
         );
-        self.cols = ((self.content.w - 2 * m.pad) / m.cell_w).max(1);
+        let pad = m.pad;
+        let (cw, _, _) = self.grid();
+        self.cols = ((self.content.w - 2 * pad) / cw).max(1);
     }
 
     fn draw(&mut self) {
@@ -1627,6 +1697,22 @@ impl App {
         self.cv.fill(bar, p.background);
         self.cv
             .fill(Rect::new(bar.x, bar_h - 1, bar.w, 1), p.border);
+        // View buttons at the right end, drawn as pixel glyphs.
+        let bs = font.height + pad / 2;
+        let mut bx = bar.x + bar.w - pad - 4 * (bs + pad / 2);
+        for v in [View::Icons, View::Thumbs, View::Compact, View::List] {
+            let r = Rect::new(bx, (bar_h - bs) / 2, bs, bs);
+            let on = self.view == v;
+            if on {
+                self.cv.fill(r, p.selected);
+                self.cv.frame(r, p.accent);
+            }
+            let col = if on { p.foreground } else { p.muted };
+            view_glyph(&mut self.cv, r.inset((bs / 5).max(2)), v, col);
+            self.hits.push((r, Hit::View(v)));
+            bx += bs + pad / 2;
+        }
+        let bar = Rect::new(bar.x, bar.y, bar.w - 4 * (bs + pad / 2) - pad, bar.h);
         let mut x = bar.x + pad;
         let ty = (bar_h - font.height) / 2;
         let can_back = !self.tab().back.is_empty();
@@ -1826,8 +1912,8 @@ impl App {
             return;
         }
         match self.view {
-            View::Icons => self.draw_icons(),
             View::List => self.draw_list(),
+            _ => self.draw_icons(),
         }
         self.draw_scrollbar();
         self.cv.reset_clip();
@@ -1851,13 +1937,9 @@ impl App {
     fn draw_icons(&mut self) {
         let p = self.p;
         let c = self.content;
-        let (pad, font, icon, cell_w, cell_h) = (
-            self.m.pad,
-            self.m.font,
-            self.m.icon,
-            self.m.cell_w,
-            self.m.cell_h,
-        );
+        let (pad, font) = (self.m.pad, self.m.font);
+        let (cell_w, cell_h, icon) = self.grid();
+        let compact = self.view == View::Compact;
         let n = self.tab().shown.len();
         let cols = self.cols.max(1) as usize;
         let scroll = self.tab().scroll;
@@ -1870,7 +1952,7 @@ impl App {
                 continue;
             };
             let sel = self.tab().selected[i];
-            let inner = r.inset((2.0 * self.m.s) as i32);
+            let inner = r.inset(if compact { 1 } else { (2.0 * self.m.s) as i32 });
             if sel {
                 self.cv.fill(inner, p.selected);
             } else if hover == Some(i) {
@@ -1879,21 +1961,58 @@ impl App {
             if i == cursor {
                 self.cv.frame(inner, if sel { p.accent } else { p.border });
             }
+            let col = if e.hidden() { p.muted } else { p.foreground };
+            if compact {
+                if let Some(img) = self.icon_for(&e, icon) {
+                    self.cv.image(
+                        r.x + pad / 2,
+                        r.y + (r.h - img.h) / 2,
+                        &img,
+                        if e.hidden() { 150 } else { 255 },
+                    );
+                }
+                let tx = r.x + pad + icon;
+                let name = self.text.ellipsize(&e.label, font, r.w - icon - 2 * pad);
+                self.text.draw(
+                    &mut self.cv,
+                    tx,
+                    r.y + (r.h - font.height) / 2,
+                    &name,
+                    font,
+                    col,
+                );
+                self.hits.push((r.intersect(&c), Hit::Item(i)));
+                continue;
+            }
             let thumb = self.thumb_for(&e);
             if let Some(img) = thumb {
                 // A thin frame makes photos read as pictures, not icons.
-                let (tx, ty) = (r.x + (r.w - img.w) / 2, r.y + pad + (icon - img.h));
+                let (tx, ty) = (
+                    r.x + (r.w - img.w) / 2,
+                    r.y + pad + (icon - img.h) / if self.view == View::Thumbs { 2 } else { 1 },
+                );
                 self.cv
                     .frame(Rect::new(tx - 1, ty - 1, img.w + 2, img.h + 2), p.border);
                 self.cv.image(tx, ty, &img, 255);
-            } else if let Some(img) = self.icon_for(&e, icon) {
+                if e.mime.starts_with("video/") {
+                    // A film strip edge marks a video.
+                    let sw = (4.0 * self.m.s).max(3.0) as i32;
+                    let mut yy = ty + 2;
+                    while yy + sw < ty + img.h {
+                        self.cv.fill(Rect::new(tx + 2, yy, sw, sw), p.background);
+                        self.cv
+                            .fill(Rect::new(tx + img.w - sw - 2, yy, sw, sw), p.background);
+                        yy += sw * 2;
+                    }
+                }
+            } else if let Some(img) = self.icon_for(&e, icon.min(256)) {
                 let alpha = if e.hidden() { 150 } else { 255 };
-                self.cv
-                    .image(r.x + (r.w - img.w) / 2, r.y + pad, &img, alpha);
+                let iy = r.y + pad + (icon - img.h) / 2;
+                self.cv.image(r.x + (r.w - img.w) / 2, iy, &img, alpha);
             }
-            let lines = self.text.wrap(&e.label, font, cell_w - pad, 2);
+            let max_lines = if self.view == View::Thumbs { 1 } else { 2 };
+            let lines = self.text.wrap(&e.label, font, cell_w - pad, max_lines);
             let mut ty = r.y + pad + icon + pad / 2;
-            let col = if e.hidden() { p.muted } else { p.foreground };
             for l in lines {
                 let tw = self.text.width(&l, font);
                 self.text
@@ -2137,10 +2256,7 @@ impl App {
             self.text
                 .draw(&mut self.cv, r.x + pad, ty, &left, small, p.muted);
         }
-        let right = match self.view {
-            View::Icons => "Ctrl+2 list",
-            View::List => "Ctrl+1 icons",
-        };
+        let right = "Ctrl+1-4 views · F1 keys";
         let rw = self.text.width(right, small);
         self.text.draw(
             &mut self.cv,
@@ -2195,10 +2311,10 @@ impl App {
 
     fn worker_messages(&mut self) {
         while let Ok(d) = self.thumbs.rx.try_recv() {
-            let fitted = d.image.map(|img| {
-                let b = self.m.icon;
-                std::rc::Rc::new(crate::icons::scale_to_fit(&img, b, b))
-            });
+            let b = self.picture_size().max(16);
+            let fitted = d
+                .image
+                .map(|img| std::rc::Rc::new(crate::icons::scale_to_fit(&img, b, b)));
             self.thumb_img.insert(d.path, fitted);
             self.dirty = true;
         }
@@ -2846,20 +2962,24 @@ impl App {
             return;
         };
         let p = self.p;
-        let (font, pad, icon) = (self.m.font, self.m.pad, self.m.icon);
+        let (font, pad) = (self.m.font, self.m.pad);
         let r = self.item_rect(i);
+        let (_, _, pic) = self.grid();
         let fr = match self.view {
-            View::Icons => Rect::new(
-                r.x - pad,
-                r.y + pad + icon + pad / 4,
-                r.w + 2 * pad,
-                font.height + pad / 2,
-            ),
             View::List => Rect::new(
                 r.x + 2 * pad + self.m.small_icon - pad / 2,
                 r.y + 1,
                 r.w / 2,
                 r.h - 2,
+            ),
+            View::Compact => {
+                Rect::new(r.x + pad + pic - pad / 2, r.y + 1, r.w - pic - pad, r.h - 2)
+            }
+            _ => Rect::new(
+                r.x - pad,
+                r.y + pad + pic + pad / 4,
+                r.w + 2 * pad,
+                font.height + pad / 2,
             ),
         };
         let fr = Rect::new(
@@ -2890,7 +3010,10 @@ impl App {
 impl App {
     /// A thumbnail when there is one; asks for it the first time.
     fn thumb_for(&mut self, e: &Entry) -> Option<std::rc::Rc<crate::canvas::Image>> {
-        if e.is_dir || !crate::thumbs::wanted(&e.mime, &self.thumb_types) || self.m.icon < 40 {
+        if e.is_dir
+            || !crate::thumbs::wanted(&e.mime, &self.thumb_types)
+            || self.picture_size() < 40
+        {
             return None;
         }
         if let Some(hit) = self.thumb_img.get(&e.path) {
@@ -2905,7 +3028,7 @@ impl App {
             path: e.path.clone(),
             mime: e.mime.clone(),
             mtime: e.mtime,
-            size: self.m.icon.max(1) as u32,
+            size: self.picture_size().max(1) as u32,
         });
         None
     }
@@ -2924,6 +3047,7 @@ impl App {
         self.reveal();
         self.dirty = true;
         self.flash(format!("Icons {} px", ZOOM[z] as i32));
+        self.remember_folder();
     }
 
     fn toggle_preview(&mut self) {
@@ -2962,7 +3086,7 @@ impl App {
     fn preview_key(&mut self, sym: u32) {
         let n = self.tab().shown.len();
         let cur = self.tab().cursor;
-        let cols = if self.view == View::Icons {
+        let cols = if self.view != View::List {
             self.cols.max(1) as usize
         } else {
             1
@@ -3786,6 +3910,167 @@ impl App {
         self.cv.tint(r, p.accent, 40);
         for k in 0..w {
             self.cv.frame(r.inset(k), p.accent);
+        }
+    }
+}
+
+impl App {
+    /// The view this folder had last time, or a picture view for a folder of
+    /// photos and films.
+    fn apply_memory(&mut self, path: &Path) {
+        let (view, zoom, sort, reverse) = match self.folders.get(path) {
+            Some(v) => *v,
+            None => {
+                let mut media = 0usize;
+                let mut total = 0usize;
+                if let Ok(rd) = std::fs::read_dir(path) {
+                    for e in rd.flatten().take(400) {
+                        let n = e.file_name().to_string_lossy().into_owned();
+                        if n.starts_with('.') {
+                            continue;
+                        }
+                        total += 1;
+                        let m = self.mime.for_name(&n);
+                        if m.starts_with("image/") || m.starts_with("video/") {
+                            media += 1;
+                        }
+                    }
+                }
+                let photos = total >= 4 && media * 2 >= total;
+                (
+                    if photos { View::Thumbs } else { View::Icons },
+                    ZOOM_DEFAULT,
+                    SortKey::Name,
+                    false,
+                )
+            }
+        };
+        if view != self.view {
+            self.view = view;
+        }
+        if zoom != self.zoom {
+            self.zoom = zoom.min(ZOOM.len() - 1);
+            self.m = metrics(&self.text, self.font_px, self.m.s, self.zoom);
+        }
+        self.sort = sort;
+        self.reverse = reverse;
+    }
+
+    fn remember_folder(&mut self) {
+        let path = self.tab().path.clone();
+        self.folders
+            .insert(path, (self.view, self.zoom, self.sort, self.reverse));
+        save_folders(&self.folders);
+    }
+}
+
+fn folders_file() -> PathBuf {
+    std::env::var_os("XDG_STATE_HOME")
+        .map(PathBuf::from)
+        .filter(|p| p.is_absolute())
+        .unwrap_or_else(|| theme::home().join(".local/state"))
+        .join("nirufm/folders.tsv")
+}
+
+fn sort_name(k: SortKey) -> &'static str {
+    match k {
+        SortKey::Name => "name",
+        SortKey::Size => "size",
+        SortKey::Modified => "modified",
+        SortKey::Type => "type",
+    }
+}
+
+fn load_folders() -> std::collections::HashMap<PathBuf, (View, usize, SortKey, bool)> {
+    let text = std::fs::read_to_string(folders_file()).unwrap_or_default();
+    text.lines()
+        .filter_map(|l| {
+            let mut f = l.split('\t');
+            let path = PathBuf::from(f.next()?);
+            let view = View::from_name(f.next()?)?;
+            let zoom = f.next()?.parse().ok()?;
+            let sort = match f.next()? {
+                "size" => SortKey::Size,
+                "modified" => SortKey::Modified,
+                "type" => SortKey::Type,
+                _ => SortKey::Name,
+            };
+            let reverse = f.next()? == "1";
+            Some((path, (view, zoom, sort, reverse)))
+        })
+        .collect()
+}
+
+fn save_folders(map: &std::collections::HashMap<PathBuf, (View, usize, SortKey, bool)>) {
+    let file = folders_file();
+    if let Some(d) = file.parent() {
+        let _ = std::fs::create_dir_all(d);
+    }
+    let mut lines: Vec<String> = map
+        .iter()
+        .filter(|(p, _)| !p.to_string_lossy().contains(['\t', '\n']))
+        .map(|(p, (v, z, s, r))| {
+            format!(
+                "{}\t{}\t{z}\t{}\t{}",
+                p.display(),
+                v.name(),
+                sort_name(*s),
+                u8::from(*r)
+            )
+        })
+        .collect();
+    lines.sort();
+    let tmp = file.with_extension("tmp");
+    if std::fs::write(&tmp, lines.join("\n") + "\n").is_ok() {
+        let _ = std::fs::rename(tmp, file);
+    }
+}
+
+/// Pixel glyphs of the view buttons.
+fn view_glyph(cv: &mut Canvas, r: Rect, v: View, col: u32) {
+    let (w, h) = (r.w, r.h);
+    match v {
+        View::Icons => {
+            let s = (w - 2) / 3;
+            for (cx, cy) in [
+                (0, 0),
+                (1, 0),
+                (2, 0),
+                (0, 1),
+                (1, 1),
+                (2, 1),
+                (0, 2),
+                (1, 2),
+                (2, 2),
+            ] {
+                cv.fill(Rect::new(r.x + cx * (s + 1), r.y + cy * (s + 1), s, s), col);
+            }
+        }
+        View::Thumbs => {
+            let s = (w - 1) / 2;
+            for (cx, cy) in [(0, 0), (1, 0), (0, 1), (1, 1)] {
+                cv.fill(Rect::new(r.x + cx * (s + 1), r.y + cy * (s + 1), s, s), col);
+            }
+        }
+        View::Compact => {
+            let rows = 4;
+            let gap = h / rows;
+            for k in 0..rows {
+                let y = r.y + k * gap;
+                cv.fill(Rect::new(r.x, y, 2, 2), col);
+                cv.fill(Rect::new(r.x + 3, y, w / 2 - 4, 2), col);
+                cv.fill(Rect::new(r.x + w / 2 + 1, y, 2, 2), col);
+                cv.fill(Rect::new(r.x + w / 2 + 4, y, w / 2 - 4, 2), col);
+            }
+        }
+        View::List => {
+            let rows = 4;
+            let gap = h / rows;
+            for k in 0..rows {
+                let y = r.y + k * gap;
+                cv.fill(Rect::new(r.x, y, 2, 2), col);
+                cv.fill(Rect::new(r.x + 3, y, w - 3, 2), col);
+            }
         }
     }
 }
