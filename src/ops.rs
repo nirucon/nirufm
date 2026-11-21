@@ -485,7 +485,7 @@ fn set_mtime(p: &Path, sec: i64, nsec: i64) {
             tv_nsec: libc::UTIME_OMIT,
         },
         libc::timespec {
-            tv_sec: sec as libc::time_t,
+            tv_sec: sec as _,
             tv_nsec: nsec as _,
         },
     ];

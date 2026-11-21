@@ -164,7 +164,7 @@ pub fn human_size(n: u64) -> String {
 /// Local date and time, "2026-11-21 18:04".
 pub fn human_time(t: i64) -> String {
     let mut tm: libc::tm = unsafe { std::mem::zeroed() };
-    let tt = t as libc::time_t;
+    let tt = t as _;
     unsafe { libc::localtime_r(&tt, &mut tm) };
     format!(
         "{:04}-{:02}-{:02} {:02}:{:02}",
