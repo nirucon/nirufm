@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Name=NIRUFM
+GenericName=File Manager
+Comment=Fast, light file manager of the NIRU suite
+Exec=nirufm %U
+Icon=nirufm
+Terminal=false
+Categories=System;FileTools;FileManager;Utility;
+MimeType=inode/directory;
+Keywords=files;folders;browser;manager;usb;
+StartupWMClass=nirufm

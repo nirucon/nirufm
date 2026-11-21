@@ -152,6 +152,8 @@ pub struct App {
     menu_place: Option<usize>,
     side_scroll: i32,
     side_total: i32,
+    apps: Option<crate::apps::Apps>,
+    menu_apps: Vec<crate::apps::App>,
 }
 
 struct ConnectForm {
@@ -206,6 +208,7 @@ enum Act {
     NcInternal,
     NcShare,
     NcBrowser,
+    OpenWith(u8),
 }
 
 struct Menu {
@@ -331,6 +334,8 @@ impl App {
             menu_place: None,
             side_scroll: 0,
             side_total: 0,
+            apps: None,
+            menu_apps: Vec::new(),
         };
         app.load_tab(0, true);
         app.x.map()?;
@@ -2394,6 +2399,12 @@ impl App {
                 }
             }
             Act::Connect => self.open_connect(None, None),
+            Act::OpenWith(k) => {
+                if let Some(app) = self.menu_apps.get(k as usize).cloned() {
+                    crate::apps::launch(&app, &sel, &here);
+                    self.flash(format!("Opening with {}", app.name));
+                }
+            }
             Act::NcPublic | Act::NcInternal | Act::NcShare | Act::NcBrowser => {
                 let Some(p) = sel.first() else { return };
                 let (cmd, done) = match a {
@@ -2563,6 +2574,22 @@ impl App {
         let trash = self.in_trash();
         if on_items && !sel.is_empty() {
             items.push(("Open".into(), Act::Open, "Enter"));
+            // "Open with" for files of one type: up to six programs.
+            let t = self.tab();
+            let mimes: Vec<String> = sel
+                .iter()
+                .filter_map(|p| t.all.iter().find(|e| &e.path == p))
+                .filter(|e| !e.is_dir)
+                .map(|e| e.mime.clone())
+                .collect();
+            self.menu_apps.clear();
+            if !mimes.is_empty() && mimes.iter().all(|m| m == &mimes[0]) {
+                let apps = self.apps.get_or_insert_with(crate::apps::Apps::load);
+                self.menu_apps = apps.for_mime(&mimes[0]).into_iter().take(6).collect();
+                for (k, a) in self.menu_apps.iter().enumerate() {
+                    items.push((format!("Open with {}", a.name), Act::OpenWith(k as u8), ""));
+                }
+            }
             if sel.iter().any(|p| p.is_dir()) {
                 items.push(("Open in a new tab".into(), Act::OpenTab, ""));
             }
@@ -3398,7 +3425,7 @@ fn keysym_char(sym: u32) -> Option<char> {
 }
 
 /// Start a program detached from this one (its own session, no stdio).
-fn spawn(cmd: &str, args: &[&std::ffi::OsStr], cwd: Option<&Path>) {
+pub(crate) fn spawn(cmd: &str, args: &[&std::ffi::OsStr], cwd: Option<&Path>) {
     use std::os::unix::process::CommandExt;
     let mut c = std::process::Command::new(cmd);
     c.args(args)
