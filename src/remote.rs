@@ -281,9 +281,84 @@ pub fn remove_bookmark(uri: &str) -> std::io::Result<()> {
     )
 }
 
+fn write_bookmark_lines(lines: &[String]) -> std::io::Result<()> {
+    let file = bookmarks_file();
+    if let Some(dir) = file.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    let body = if lines.is_empty() {
+        String::new()
+    } else {
+        lines.join("\n") + "\n"
+    };
+    // Written beside and renamed, so GTK programs never read half a list.
+    let tmp = file.with_extension("nirufm-tmp");
+    std::fs::write(&tmp, body)?;
+    std::fs::rename(&tmp, &file)
+}
+
+fn bookmark_lines() -> Vec<String> {
+    std::fs::read_to_string(bookmarks_file())
+        .unwrap_or_default()
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+/// Move the bookmark at position `from` to position `to` (in list order).
+pub fn move_bookmark(from: usize, to: usize) -> std::io::Result<()> {
+    let mut lines = bookmark_lines();
+    if from >= lines.len() || from == to {
+        return Ok(());
+    }
+    let to = to.min(lines.len() - 1);
+    let l = lines.remove(from);
+    lines.insert(to, l);
+    write_bookmark_lines(&lines)
+}
+
+/// Give a bookmark its own name; an empty name goes back to the folder name.
+pub fn rename_bookmark(uri: &str, label: &str) -> std::io::Result<()> {
+    let label = label.trim().replace(['\n', '\r'], " ");
+    let lines: Vec<String> = bookmark_lines()
+        .into_iter()
+        .map(|l| {
+            if l.split(' ').next() == Some(uri) {
+                if label.is_empty() {
+                    uri.to_string()
+                } else {
+                    format!("{uri} {label}")
+                }
+            } else {
+                l
+            }
+        })
+        .collect();
+    write_bookmark_lines(&lines)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bookmarks_move_and_get_names() {
+        let dir = std::env::temp_dir().join(format!("nirufm-bm-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("gtk-3.0")).unwrap();
+        std::env::set_var("XDG_CONFIG_HOME", &dir);
+        std::fs::write(
+            dir.join("gtk-3.0/bookmarks"),
+            "file:///a\nfile:///b Bee\nsftp://h/c\n",
+        )
+        .unwrap();
+        move_bookmark(2, 0).unwrap();
+        rename_bookmark("file:///a", "Alpha one").unwrap();
+        rename_bookmark("file:///b", "").unwrap();
+        let text = std::fs::read_to_string(dir.join("gtk-3.0/bookmarks")).unwrap();
+        assert_eq!(text, "sftp://h/c\nfile:///a Alpha one\nfile:///b\n");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn gvfs_folder_names_become_uris() {

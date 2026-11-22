@@ -69,4 +69,29 @@ for x in 520 700 1000 1200 1350 1400; do xdotool mousemove $x 300; sleep 0.08; d
 sleep 0.3; xdotool mouseup 1; sleep 1.2
 [ -f "$SB/b/second.txt" ] || fail "drop on the other window"
 echo "drag and drop ok"
+
+# Bookmarks are put in order by dragging them in the side panel.
+mkdir -p "$XDG_CONFIG_HOME/gtk-3.0"
+printf 'file://%s Bravo\nfile://%s Alpha\nfile://%s/photos Photos\n' "$SB/b" "$SB/a" "$SB/a" > "$XDG_CONFIG_HOME/gtk-3.0/bookmarks"
+NIRUFM_PLACES=1 "$BIN" "$SB/b" 2>"$SB/c.err" &
+C=$!
+PIDS="$PIDS $C"
+sleep 1.2
+WC=$(xdotool search --pid "$C" | head -1)
+xdotool windowmove "$WC" 0 0; xdotool windowraise "$WC"; sleep 0.5
+row() { grep "^place $1 " "$SB/c.err" | tail -1 | awk '{print $3, $4}'; }
+set -- $(row Photos); px=$1; py=$2
+set -- $(row Bravo); by=$2
+[ -n "$px" ] && [ -n "$by" ] || fail "bookmark rows not found: $(tail -5 "$SB/c.err")"
+xdotool mousemove "$px" "$py" mousedown 1
+y=$py; while [ "$y" -gt "$by" ]; do y=$((y - 8)); xdotool mousemove "$px" "$y"; sleep 0.03; done
+xdotool mousemove "$px" "$by"; sleep 0.2; xdotool mouseup 1; sleep 0.6
+first=$(head -1 "$XDG_CONFIG_HOME/gtk-3.0/bookmarks")
+[ "$first" = "file://$SB/a/photos Photos" ] || fail "drag did not reorder: $(cat "$XDG_CONFIG_HOME/gtk-3.0/bookmarks")"
+[ "$(wc -l < "$XDG_CONFIG_HOME/gtk-3.0/bookmarks")" = 3 ] || fail 'a bookmark was lost'
+# A click without moving still opens the bookmark.
+set -- $(row Alpha)
+xdotool mousemove "$1" "$2" click 1; sleep 0.6
+grep -q "^place " "$SB/c.err" || fail 'no rows'
+echo "bookmark order ok"
 echo "PASS"

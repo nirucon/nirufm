@@ -178,6 +178,12 @@ pub struct App {
     mounts_fd: i32,
     connect: Option<ConnectForm>,
     menu_place: Option<usize>,
+    /// A bookmark pressed in the side panel: its row and the press height.
+    place_press: Option<(usize, i32)>,
+    /// While a bookmark is dragged: the row it would move to.
+    place_drag_to: Option<usize>,
+    /// A bookmark being renamed in the side panel.
+    place_rename: Option<(usize, String)>,
     side_scroll: i32,
     side_total: i32,
     apps: Option<crate::apps::Apps>,
@@ -311,6 +317,11 @@ enum Act {
     CopyPath,
     Bookmark,
     RemoveBookmark,
+    BookmarkUp,
+    BookmarkDown,
+    RenameBookmark,
+    PlaceTab,
+    BookmarkSelected,
     Connect,
     NcPublic,
     NcInternal,
@@ -449,6 +460,9 @@ impl App {
             mounts_fd,
             connect: None,
             menu_place: None,
+            place_press: None,
+            place_drag_to: None,
+            place_rename: None,
             side_scroll: 0,
             side_total: 0,
             apps: None,
@@ -985,6 +999,16 @@ impl App {
                         );
                     }
                 }
+                // For the end-to-end test: where the side panel rows are.
+                if std::env::var_os("NIRUFM_PLACES").is_some() {
+                    for (r, h) in &self.hits {
+                        if let Hit::Place(i) = h {
+                            if let Some(pl) = self.places.get(*i) {
+                                eprintln!("place {} {} {}", pl.label, r.x + r.w / 2, r.y + r.h / 2);
+                            }
+                        }
+                    }
+                }
                 continue;
             }
             self.x.c.flush()?;
@@ -1109,6 +1133,12 @@ impl App {
                     }
                 }
             }
+            Event::ButtonRelease(e) if e.detail == 1 && self.place_press.is_some() => {
+                self.place_release()
+            }
+            Event::MotionNotify(e) if self.place_press.is_some() => {
+                self.place_motion(e.event_x as i32, e.event_y as i32)
+            }
             Event::ButtonRelease(e) if e.detail == 1 => self.release(
                 e.event_x as i32,
                 e.event_y as i32,
@@ -1207,6 +1237,9 @@ impl App {
         if self.rename.is_some() {
             self.commit_rename();
         }
+        if self.place_rename.is_some() {
+            self.commit_place_rename();
+        }
         if b == 3 {
             match self.hit(x, y) {
                 Some(Hit::Place(i)) if self.places.get(i).is_some_and(|p| p.bookmark) => {
@@ -1214,7 +1247,13 @@ impl App {
                     self.menu = Some(Menu {
                         x,
                         y,
-                        items: vec![("Remove bookmark".into(), Act::RemoveBookmark, "")],
+                        items: vec![
+                            ("Open in a new tab".into(), Act::PlaceTab, ""),
+                            ("Move up".into(), Act::BookmarkUp, ""),
+                            ("Move down".into(), Act::BookmarkDown, ""),
+                            ("Rename bookmark".into(), Act::RenameBookmark, ""),
+                            ("Remove bookmark".into(), Act::RemoveBookmark, ""),
+                        ],
                         hover: None,
                     });
                     self.dirty = true;
@@ -1265,24 +1304,13 @@ impl App {
         }
         let Some(h) = self.hit(x, y) else { return };
         match (b, h) {
-            (1, Hit::Place(i)) => {
-                if let Some(pl) = self.places.get(i).cloned() {
-                    if pl.icon == "document-open-recent" {
-                        self.show_recent();
-                    } else if pl.connect {
-                        self.open_connect(None, None);
-                    } else if let (Some(dev), false) = (&pl.dev, pl.mounted) {
-                        self.submit(crate::ops::Job::Mount { dev: dev.clone() });
-                    } else if let (Some(uri), false) = (&pl.uri, pl.mounted) {
-                        self.submit(crate::ops::Job::Connect {
-                            uri: uri.clone(),
-                            login: None,
-                        });
-                    } else {
-                        self.go(pl.path);
-                    }
-                }
+            // A bookmark opens when the button is released, so it can be
+            // dragged to another place in the list first.
+            (1, Hit::Place(i)) if self.places.get(i).is_some_and(|p| p.bookmark) => {
+                self.place_press = Some((i, y));
+                self.place_drag_to = None;
             }
+            (1, Hit::Place(i)) => self.open_place(i),
             (1, Hit::Eject(i)) => {
                 if let Some(pl) = self.places.get(i).cloned() {
                     if let (Some(uri), None) = (&pl.uri, &pl.dev) {
@@ -1434,6 +1462,9 @@ impl App {
         }
         if self.rename.is_some() {
             return self.rename_key(sym, ctrl);
+        }
+        if self.place_rename.is_some() {
+            return self.place_rename_key(sym, ctrl);
         }
         if self.preview.is_some() {
             return self.preview_key(sym);
@@ -1932,6 +1963,34 @@ impl App {
             } else {
                 0
             };
+            // A bookmark being dragged: a line where it would land.
+            if let (Some((from, _)), Some(to)) = (self.place_press, self.place_drag_to) {
+                if to == i && from != i {
+                    let lw = (2.0 * self.m.s).max(2.0) as i32;
+                    let ly = if from > i { r.y } else { r.y + r.h - lw };
+                    self.cv.fill(Rect::new(r.x, ly, r.w, lw), p.accent);
+                }
+            }
+            if let Some((_, buf)) = self.place_rename.as_ref().filter(|(k, _)| *k == i) {
+                let field = Rect::new(tx - pad / 2, y + 1, sw - tx - pad / 2, row - 2);
+                self.cv.fill(field, p.background);
+                self.cv.fill(
+                    Rect::new(field.x, field.y + field.h - 1, field.w, 1),
+                    p.accent,
+                );
+                let shown = buf.clone() + "▏";
+                self.text.draw(
+                    &mut self.cv,
+                    tx,
+                    y + (row - font.height) / 2,
+                    &shown,
+                    font,
+                    p.foreground,
+                );
+                y += row;
+                self.hits.push((r, Hit::Place(i)));
+                continue;
+            }
             let label = self.text.ellipsize(&pl.label, font, sw - tx - pad - ew);
             let col = if here {
                 p.foreground
@@ -2996,6 +3055,61 @@ impl App {
                 Ok(false) => self.flash("Already bookmarked".into()),
                 Err(e) => self.flash_error(format!("Could not bookmark: {e}")),
             },
+            Act::PlaceTab => {
+                if let Some(p) = self
+                    .menu_place
+                    .take()
+                    .and_then(|i| self.places.get(i))
+                    .map(|p| p.path.clone())
+                {
+                    if !p.as_os_str().is_empty() {
+                        self.new_tab(p);
+                    }
+                }
+            }
+            Act::BookmarkUp | Act::BookmarkDown => {
+                if let Some(i) = self.menu_place.take() {
+                    let rows: Vec<usize> = (0..self.places.len())
+                        .filter(|&k| self.places[k].bookmark)
+                        .collect();
+                    if let Some(k) = rows.iter().position(|&r| r == i) {
+                        let other = if a == Act::BookmarkUp {
+                            k.checked_sub(1)
+                        } else {
+                            (k + 1 < rows.len()).then_some(k + 1)
+                        };
+                        if let Some(o) = other {
+                            self.move_bookmark_row(i, rows[o]);
+                        }
+                    }
+                }
+            }
+            Act::RenameBookmark => {
+                if let Some(i) = self.menu_place.take() {
+                    if let Some(pl) = self.places.get(i) {
+                        self.place_rename = Some((i, pl.label.clone()));
+                    }
+                }
+            }
+            Act::BookmarkSelected => {
+                let dirs: Vec<PathBuf> = self
+                    .selection_paths()
+                    .into_iter()
+                    .filter(|p| p.is_dir())
+                    .collect();
+                let mut added = 0;
+                for d in &dirs {
+                    if let Ok(true) = crate::remote::add_bookmark(d) {
+                        added += 1;
+                    }
+                }
+                self.flash(match added {
+                    0 => "Already bookmarked".into(),
+                    1 => "Bookmarked".into(),
+                    n => format!("{n} bookmarks added"),
+                });
+                self.refresh_places();
+            }
             Act::RemoveBookmark => {
                 if let Some(pl) = self
                     .menu_place
@@ -3156,6 +3270,122 @@ impl App {
         }
     }
 
+    /// Open a place of the side panel: go there, mount it or connect.
+    fn open_place(&mut self, i: usize) {
+        if let Some(pl) = self.places.get(i).cloned() {
+            if pl.icon == "document-open-recent" {
+                self.show_recent();
+            } else if pl.connect {
+                self.open_connect(None, None);
+            } else if let (Some(dev), false) = (&pl.dev, pl.mounted) {
+                self.submit(crate::ops::Job::Mount { dev: dev.clone() });
+            } else if let (Some(uri), false) = (&pl.uri, pl.mounted) {
+                self.submit(crate::ops::Job::Connect {
+                    uri: uri.clone(),
+                    login: None,
+                });
+            } else {
+                self.go(pl.path);
+            }
+        }
+    }
+
+    /// Position of a side panel row among the bookmarks (the file order).
+    fn bookmark_pos(&self, i: usize) -> Option<usize> {
+        self.places.get(i).filter(|p| p.bookmark)?;
+        Some(self.places[..i].iter().filter(|p| p.bookmark).count())
+    }
+
+    fn move_bookmark_row(&mut self, from: usize, to: usize) {
+        if let (Some(a), Some(b)) = (self.bookmark_pos(from), self.bookmark_pos(to)) {
+            match crate::remote::move_bookmark(a, b) {
+                Ok(()) => self.refresh_places(),
+                Err(e) => self.flash_error(format!("Could not move the bookmark: {e}")),
+            }
+        }
+    }
+
+    fn place_motion(&mut self, x: i32, y: i32) {
+        let Some((from, py)) = self.place_press else {
+            return;
+        };
+        if self.place_drag_to.is_none() && (y - py).abs() <= (6.0 * self.m.s) as i32 {
+            return;
+        }
+        let to = match self.hit(x.min(self.m.side_w - 1), y) {
+            Some(Hit::Place(j) | Hit::Eject(j))
+                if self.places.get(j).is_some_and(|p| p.bookmark) =>
+            {
+                j
+            }
+            _ => self.place_drag_to.unwrap_or(from),
+        };
+        if self.place_drag_to != Some(to) {
+            self.place_drag_to = Some(to);
+            self.dirty = true;
+        }
+    }
+
+    /// The end of a press on a bookmark: a move when it was dragged,
+    /// otherwise a click.
+    fn place_release(&mut self) {
+        let Some((from, _)) = self.place_press.take() else {
+            return;
+        };
+        match self.place_drag_to.take() {
+            Some(to) if to != from => self.move_bookmark_row(from, to),
+            Some(_) => {}
+            None => self.open_place(from),
+        }
+        self.dirty = true;
+    }
+
+    fn place_rename_key(&mut self, sym: u32, ctrl: bool) {
+        let Some((_, buf)) = self.place_rename.as_mut() else {
+            return;
+        };
+        match sym {
+            0xff1b => self.place_rename = None,
+            0xff0d | 0xff8d => self.commit_place_rename(),
+            0xff08 => {
+                if ctrl {
+                    buf.clear();
+                } else {
+                    buf.pop();
+                }
+            }
+            _ => {
+                if let Some(c) = keysym_char(sym) {
+                    if !c.is_control() {
+                        buf.push(c);
+                    }
+                }
+            }
+        }
+        self.dirty = true;
+    }
+
+    fn commit_place_rename(&mut self) {
+        let Some((i, name)) = self.place_rename.take() else {
+            return;
+        };
+        self.dirty = true;
+        let Some(pl) = self.places.get(i).cloned() else {
+            return;
+        };
+        if name.trim() == pl.label {
+            return;
+        }
+        let uri = pl
+            .uri
+            .clone()
+            .unwrap_or_else(|| crate::x::file_uri(&pl.path));
+        match crate::remote::rename_bookmark(&uri, &name) {
+            Ok(()) => self.refresh_places(),
+            Err(e) => self.flash_error(format!("Could not rename the bookmark: {e}")),
+        }
+    }
+
     fn rename_key(&mut self, sym: u32, ctrl: bool) {
         let Some((_, buf)) = self.rename.as_mut() else {
             return;
@@ -3237,6 +3467,7 @@ impl App {
             }
             if sel.iter().any(|p| p.is_dir()) {
                 items.push(("Open in a new tab".into(), Act::OpenTab, ""));
+                items.push(("Add to bookmarks".into(), Act::BookmarkSelected, ""));
             }
             if trash {
                 items.push(("Restore".into(), Act::Restore, ""));
