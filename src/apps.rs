@@ -206,7 +206,8 @@ pub fn command(exec: &str, files: &[PathBuf]) -> Vec<String> {
 pub fn launch(app: &App, files: &[PathBuf], cwd: &Path) {
     let mut cmd = command(&app.exec, files);
     if app.terminal {
-        let mut t = vec!["kitty".to_string()];
+        let mut t = crate::theme::configured_terminal(&crate::theme::config_home());
+        t.push("-e".to_string());
         t.append(&mut cmd);
         cmd = t;
     }

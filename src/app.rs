@@ -1525,11 +1525,7 @@ impl App {
             0xffc1 => {
                 // F4: a terminal here
                 let p = self.tab().path.clone();
-                spawn(
-                    "kitty",
-                    &[std::ffi::OsStr::new("--directory"), p.as_os_str()],
-                    Some(&p),
-                );
+                open_terminal(&p);
             }
             0xff09 | 0xfe20 if ctrl => {
                 // Ctrl+Tab, Ctrl+Shift+Tab
@@ -2991,11 +2987,7 @@ impl App {
                     Err(e) => self.flash_error(format!("Could not create the folder: {e}")),
                 }
             }
-            Act::Terminal => spawn(
-                "kitty",
-                &[std::ffi::OsStr::new("--directory"), here.as_os_str()],
-                Some(&here),
-            ),
+            Act::Terminal => open_terminal(&here),
             Act::Bookmark => match crate::remote::add_bookmark(&here) {
                 Ok(true) => {
                     self.flash(format!("Bookmarked {}", places::pretty(&here)));
@@ -5760,6 +5752,14 @@ fn keysym_char(sym: u32) -> Option<char> {
 }
 
 /// Start a program detached from this one (its own session, no stdio).
+/// The suite's terminal, started in `dir` (every terminal starts in its own
+/// working folder, so no terminal-specific option is needed).
+fn open_terminal(dir: &Path) {
+    let t = crate::theme::configured_terminal(&crate::theme::config_home());
+    let args: Vec<&std::ffi::OsStr> = t[1..].iter().map(std::ffi::OsStr::new).collect();
+    spawn(&t[0], &args, Some(dir));
+}
+
 pub(crate) fn spawn(cmd: &str, args: &[&std::ffi::OsStr], cwd: Option<&Path>) {
     use std::os::unix::process::CommandExt;
     let mut c = std::process::Command::new(cmd);

@@ -111,6 +111,31 @@ pub fn configured_theme(base: &Path) -> String {
         .unwrap_or_else(|| "niru-noir".to_string())
 }
 
+/// The suite's terminal (`terminal` in the NIRUWM configuration, the one on
+/// Super+Enter). Without one: NIRUTERM when installed, else kitty.
+pub fn configured_terminal(base: &Path) -> Vec<String> {
+    let set: Vec<String> = read_toml(&base.join("niruwm/config.toml"))
+        .and_then(|v| {
+            v.get("terminal")?.as_array().map(|a| {
+                a.iter()
+                    .filter_map(|x| x.as_str().map(str::to_string))
+                    .collect()
+            })
+        })
+        .unwrap_or_default();
+    if let Some(first) = set.first() {
+        if crate::archive::have(first) {
+            return set;
+        }
+    }
+    let fallback = if crate::archive::have("niruterm") {
+        "niruterm"
+    } else {
+        "kitty"
+    };
+    vec![fallback.to_string()]
+}
+
 /// The font size of the suite (`font_size` in the NIRUWM configuration).
 pub fn configured_font_size(base: &Path) -> Option<f32> {
     let v = read_toml(&base.join("niruwm/config.toml"))?;
