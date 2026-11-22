@@ -1,11 +1,28 @@
-//! Icons from the freedesktop icon theme (Papirus in NIRUX), rendered once
-//! per (name, size) and kept. SVG goes through resvg; PNG is decoded and
-//! scaled. A light NIRU theme switches to the light icon set.
+//! Icons, rendered once per (name, size) and kept.
+//!
+//! By default the NIRUX icon set (the niruicons crate) draws the icons it
+//! has, in the colours of the NIRU theme. Everything else comes from the
+//! freedesktop icon theme (Papirus in NIRUX) and is drawn grey ("noir"), so
+//! it sits quietly beside the set. `icons = "theme"` in
+//! `~/.config/nirufm/config.toml` uses the icon theme alone, in its own
+//! colours. SVG goes through resvg; PNG is decoded and scaled. A light NIRU
+//! theme switches to the light Papirus variant.
 use crate::canvas::Image;
 use std::collections::HashMap;
 use std::path::PathBuf;
 
+/// Which icons draw files and places.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Style {
+    /// The NIRUX set in theme colours, the icon theme in grey for the rest.
+    Nirux,
+    /// The icon theme alone, in its own colours.
+    Theme,
+}
+
 pub struct Icons {
+    style: Style,
+    palette: niruicons::Palette,
     themes: Vec<String>,
     dirs: Vec<PathBuf>,
     files: HashMap<String, Option<PathBuf>>,
@@ -23,15 +40,28 @@ const CONTEXTS: [&str; 7] = [
 ];
 
 impl Icons {
-    pub fn new(light: bool) -> Self {
+    pub fn new(p: &crate::theme::Palette, style: Style) -> Self {
         let mut i = Self {
+            style,
+            palette: set_palette(p),
             themes: Vec::new(),
             dirs: icon_dirs(),
             files: HashMap::new(),
             cache: HashMap::new(),
         };
-        i.set_light(light);
+        i.set_light(p.is_light());
         i
+    }
+
+    /// Follow a theme change: the set is recoloured, Papirus may switch
+    /// between its dark and light variants.
+    pub fn set_theme(&mut self, p: &crate::theme::Palette) {
+        let palette = set_palette(p);
+        if palette != self.palette {
+            self.palette = palette;
+            self.cache.clear();
+        }
+        self.set_light(p.is_light());
     }
 
     pub fn set_light(&mut self, light: bool) {
@@ -102,8 +132,52 @@ impl Icons {
         found
     }
 
-    /// The first of `names` the theme has, rendered at `size` pixels.
+    /// The first of `names` there is an icon for, rendered at `size` pixels.
+    ///
+    /// With the NIRUX style the set is asked first for every name but the
+    /// last-resort ones (`text-x-generic`, `unknown`), then the icon theme
+    /// for all of them, and the set's last-resort icons only after that: a
+    /// type the set has no picture for gets the theme's own icon, in grey.
     pub fn get(&mut self, names: &[String], size: i32) -> Option<std::rc::Rc<Image>> {
+        if self.style == Style::Nirux {
+            let last_resort =
+                |i: usize, n: &str| i > 0 && (n == "text-x-generic" || n == "unknown");
+            for (i, n) in names.iter().enumerate() {
+                if !last_resort(i, n) {
+                    if let Some(img) = self.set_icon(n, size) {
+                        return Some(img);
+                    }
+                }
+            }
+            if let Some(img) = self.theme_icon(names, size) {
+                return Some(img);
+            }
+            return names.iter().find_map(|n| self.set_icon(n, size));
+        }
+        self.theme_icon(names, size)
+    }
+
+    fn set_icon(&mut self, name: &str, size: i32) -> Option<std::rc::Rc<Image>> {
+        if !niruicons::has(name) {
+            return None;
+        }
+        let key = (format!("nirux:{name}"), size);
+        if let Some(hit) = self.cache.get(&key) {
+            return hit.clone();
+        }
+        let img = niruicons::render(name, size, &self.palette).map(|i| {
+            std::rc::Rc::new(Image {
+                w: i.w,
+                h: i.h,
+                data: i.data,
+            })
+        });
+        self.cache.insert(key, img.clone());
+        img
+    }
+
+    fn theme_icon(&mut self, names: &[String], size: i32) -> Option<std::rc::Rc<Image>> {
+        let noir = self.style == Style::Nirux;
         for n in names {
             let key = (n.clone(), size);
             if let Some(hit) = self.cache.get(&key) {
@@ -115,7 +189,12 @@ impl Icons {
             let img = self
                 .find(n, size)
                 .and_then(|p| render_file(&p, size))
-                .map(std::rc::Rc::new);
+                .map(|mut img| {
+                    if noir {
+                        niruicons::noir(&mut img.data);
+                    }
+                    std::rc::Rc::new(img)
+                });
             self.cache.insert(key, img.clone());
             if img.is_some() {
                 return img;
@@ -126,6 +205,25 @@ impl Icons {
 
     pub fn named(&mut self, name: &str, size: i32) -> Option<std::rc::Rc<Image>> {
         self.get(&[name.to_string()], size)
+    }
+}
+
+fn set_palette(p: &crate::theme::Palette) -> niruicons::Palette {
+    niruicons::Palette {
+        background: p.background,
+        foreground: p.foreground,
+        accent: p.accent,
+    }
+}
+
+/// `icons` in `~/.config/nirufm/config.toml`: "nirux" (the default) or
+/// "theme".
+pub fn configured_style(base: &std::path::Path) -> Style {
+    let text = std::fs::read_to_string(base.join("nirufm/config.toml")).unwrap_or_default();
+    let v = text.parse::<toml::Value>().ok();
+    match v.as_ref().and_then(|v| v.get("icons")?.as_str()) {
+        Some("theme") => Style::Theme,
+        _ => Style::Nirux,
     }
 }
 

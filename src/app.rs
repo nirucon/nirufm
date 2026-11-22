@@ -406,7 +406,7 @@ impl App {
         };
         let mut app = App {
             cv: Canvas::new((1120.0 * s) as i32, (720.0 * s) as i32),
-            icons: Icons::new(p.is_light()),
+            icons: Icons::new(&p, crate::icons::configured_style(&theme::config_home())),
             mime: Mime::load(),
             x,
             text,
@@ -810,7 +810,7 @@ impl App {
         if p != self.p || name != self.theme {
             self.p = p;
             self.theme = name;
-            self.icons.set_light(p.is_light());
+            self.icons.set_theme(&p);
             let _ = self.x.set_icon(&crate::logo::window_icons(&p));
             self.dirty = true;
         }
@@ -1952,7 +1952,10 @@ impl App {
                     p.accent,
                 );
             }
-            let names = [pl.icon.to_string(), "folder".to_string()];
+            let mut names = vec![pl.icon.to_string(), "folder".to_string()];
+            if pl.icon == "user-trash" && trash_has_files(&pl.path) {
+                names.insert(0, "user-trash-full".into());
+            }
             if let Some(img) = self.icons.get(&names, si) {
                 self.cv.image(pad * 2, y + (row - img.h) / 2, &img, 255);
             }
@@ -5939,7 +5942,12 @@ fn metrics(text: &Text, font_px: f32, s: f32, zoom: usize) -> Metrics {
     }
 }
 
-/// Papirus has named icons for the XDG folders.
+/// The trash shows full when its files folder has anything in it.
+fn trash_has_files(files: &Path) -> bool {
+    std::fs::read_dir(files).is_ok_and(|mut d| d.next().is_some())
+}
+
+/// Icon names for the XDG folders (the NIRUX set and Papirus have them).
 fn folder_icon(p: &Path) -> &'static str {
     let home = theme::home();
     if p == home {

@@ -150,9 +150,9 @@ dependencies = [
 
 [[package]]
 name = "hashbrown"
-version = "0.17.1"
+version = "0.17.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ed5909b6e89a2db4456e54cd5f673791d7eca6732202bbf2a9cc504fe2f9b84a"
+checksum = "735eaa21a6a5ffb2e84362faaeb90c05ba8e19797ca30428478cb6ea3a4921bc"
 
 [[package]]
 name = "imagesize"
@@ -227,15 +227,21 @@ dependencies = [
 
 [[package]]
 name = "nirufm"
-version = "0.2.4"
+version = "0.3.0"
 dependencies = [
  "ab_glyph",
  "libc",
+ "niruicons",
  "png",
  "resvg",
  "toml",
  "x11rb",
 ]
+
+[[package]]
+name = "niruicons"
+version = "0.1.0"
+source = "git+https://github.com/nirucon/niruicons?tag=v0.1.0#cf462e45a9744bd9433d3fa4e657395dbfadafac"
 
 [[package]]
 name = "num-traits"

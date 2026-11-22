@@ -27,6 +27,13 @@ Measured on the same machine in the same X server (Debian 13). A folder of
 - **Gallery** for photos and films: film strip, slideshow, full screen, zoom
   and pan, turning, EXIF facts, "set as wallpaper", trash. Enter on a photo or
   Ctrl+G.
+- **NIRUX icons:** retro pixel icons from
+  [NIRUICONS](https://github.com/nirucon/niruicons) for folders, places,
+  drives and the common file types, in the colours of the NIRU theme. A theme
+  change recolours them at once. Types the set has no picture for take the
+  icon theme's (Papirus) icon in grey. `icons = "theme"` in
+  `~/.config/nirufm/config.toml` uses the icon theme alone, in its own
+  colours.
 - **Preview** with Space: pictures, the first page of a PDF, text.
 - **Thumbnails** through the freedesktop cache and the system's thumbnailers,
   shared with every other program.
@@ -78,7 +85,8 @@ sh tests/xvfb.sh target/release/nirufm   # end-to-end test in a private Xvfb
 ```
 
 Needs Rust 1.82 or later. At run time: an X server, fontconfig (`fc-match`),
-the shared MIME database and an icon theme. Optional: gdk-pixbuf and
+the shared MIME database and an icon theme for the types the NIRUX set does
+not draw. Optional: gdk-pixbuf and
 ffmpegthumbnailer (thumbnails), poppler-utils (PDF preview), udisks2 (drives),
 gvfs with gvfs-fuse (servers), zip, unzip, 7z or bsdtar (archives). NIRUX
 installs all of them.
