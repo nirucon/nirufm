@@ -42,7 +42,14 @@ Measured on the same machine in the same X server (Debian 13). A folder of
   written to a partial file first and nothing is ever overwritten: an existing
   name gets " (2)".
 - **Clipboard** shared with other file managers, and **drag and drop** in and
-  out (XDND), onto folders, places, tabs and the other pane.
+  out (XDND), onto folders, places, tabs and the other pane. A label beside
+  the pointer says how many files and whether they move or copy, a folder
+  held under the pointer opens so the drop can go deeper, the folder scrolls
+  when the pointer nears its edge, and Esc cancels.
+- **Select with the mouse:** drag a band from blank space, or from beside a
+  name, over the files (in the list view it takes whole rows). Ctrl adds to
+  the selection, Shift flips what the band covers, Esc puts it back; the
+  folder scrolls on when the band reaches its edge.
 - **Tabs and two panes** (F3), **search** below a folder (Ctrl+F), a
   **properties** sheet with folder totals and SHA-256 (Alt+Enter).
 - **Pack and unpack** zip, tar.gz, 7z and more.

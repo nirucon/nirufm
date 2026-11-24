@@ -99,6 +99,26 @@ impl Canvas {
         self.fill(Rect::new(r.x + r.w - 1, r.y, 1, r.h), color);
     }
 
+    /// A dashed one-pixel frame, the dashes `dash` pixels long: the rubber
+    /// band's edge, in the manner of old desktops.
+    pub fn dashed(&mut self, r: Rect, color: u32, dash: i32) {
+        let dash = dash.max(1);
+        let mut x = r.x;
+        while x < r.x + r.w {
+            let w = dash.min(r.x + r.w - x);
+            self.fill(Rect::new(x, r.y, w, 1), color);
+            self.fill(Rect::new(x, r.y + r.h - 1, w, 1), color);
+            x += 2 * dash;
+        }
+        let mut y = r.y;
+        while y < r.y + r.h {
+            let h = dash.min(r.y + r.h - y);
+            self.fill(Rect::new(r.x, y, 1, h), color);
+            self.fill(Rect::new(r.x + r.w - 1, y, 1, h), color);
+            y += 2 * dash;
+        }
+    }
+
     /// Blend `color` with coverage 0..=255 at one pixel (already clipped).
     #[inline]
     fn blend_at(&mut self, i: usize, color: u32, a: u32) {

@@ -6,7 +6,7 @@ set -eu
 BIN=$(cd "$(dirname "$1")" && pwd)/$(basename "$1")
 SB=$(mktemp -d)
 PIDS=""
-cleanup() { for p in $PIDS; do kill "$p" 2>/dev/null || true; done; rm -rf "$SB"; }
+cleanup() { for p in $PIDS; do kill "$p" 2>/dev/null || true; done; if [ -n "${KEEP:-}" ]; then echo "sandbox $SB"; else rm -rf "$SB"; fi; }
 trap cleanup EXIT INT TERM
 export HOME=$SB/home XDG_DATA_HOME=$SB/data XDG_CONFIG_HOME=$SB/config XDG_CACHE_HOME=$SB/cache
 mkdir -p "$HOME" "$SB/a/photos" "$SB/b" "$XDG_DATA_HOME" "$XDG_CONFIG_HOME"
@@ -69,6 +69,78 @@ for x in 520 700 1000 1200 1350 1400; do xdotool mousemove $x 300; sleep 0.08; d
 sleep 0.3; xdotool mouseup 1; sleep 1.2
 [ -f "$SB/b/second.txt" ] || fail "drop on the other window"
 echo "drag and drop ok"
+
+# Selecting with the mouse: a band from blank space over three files.
+mkdir -p "$SB/c/deep"
+for i in 1 2 3 4 5; do echo "$i" > "$SB/c/f$i.txt"; done
+NIRUFM_PLACES=1 "$BIN" "$SB/c" 2>"$SB/band.err" &
+E=$!
+PIDS="$PIDS $E"
+sleep 1.2
+WE=$(xdotool search --pid "$E" | head -1)
+xdotool windowmove "$WE" 0 0; xdotool windowraise "$WE"; sleep 0.5
+item() { grep "^item $1 " "$SB/band.err" | tail -1 | awk '{print $3, $4, $5, $6}'; }
+sel() { grep '^state ' "$SB/band.err" | tail -1 | awk '{print $2}'; }
+# Cells: deep, f1.txt .. f5.txt. From below f1 to the middle of f3.
+set -- $(item f1.txt); x1=$1; y1=$2; h1=$4
+set -- $(item f3.txt); x3=$(($1 + $3 / 2)); y3=$(($2 + $4 / 2))
+[ -n "$x1" ] && [ -n "$x3" ] || fail "items not found: $(tail -3 "$SB/band.err")"
+xdotool mousemove $((x1 + 4)) $((y1 + h1 + 40)) mousedown 1
+for t in 1 2 3 4 5; do xdotool mousemove $((x1 + 4 + (x3 - x1) * t / 5)) $((y1 + h1 + 40 - (y1 + h1 + 40 - y3) * t / 5)); sleep 0.05; done
+sleep 0.2
+[ "$(sel)" = 3 ] || fail "band selected $(sel), not 3"
+# Esc while drawing puts the selection back (nothing).
+xdotool key Escape; sleep 0.3; xdotool mouseup 1; sleep 0.3
+[ "$(sel)" = 0 ] || fail "Esc left $(sel) selected"
+# Draw it again and let go: three stay selected; Ctrl adds f5.
+xdotool mousemove $((x1 + 4)) $((y1 + h1 + 40)) mousedown 1
+for t in 1 2 3 4 5; do xdotool mousemove $((x1 + 4 + (x3 - x1) * t / 5)) $((y1 + h1 + 40 - (y1 + h1 + 40 - y3) * t / 5)); sleep 0.05; done
+xdotool mouseup 1; sleep 0.3
+[ "$(sel)" = 3 ] || fail "band kept $(sel), not 3"
+set -- $(item f5.txt); x5=$(($1 + $3 / 2)); y5=$(($2 + $4 / 2)); b5=$(($2 + $4 + 30))
+xdotool keydown ctrl mousemove "$x5" "$b5" mousedown 1
+xdotool mousemove $((x5 + 20)) $((b5 - 10)); sleep 0.05; xdotool mousemove "$x5" "$y5"; sleep 0.2
+xdotool mouseup 1 keyup ctrl; sleep 0.3
+[ "$(sel)" = 4 ] || fail "Ctrl band made $(sel), not 4"
+# A click on blank space clears it.
+xdotool mousemove $((x1 + 4)) $((y1 + h1 + 60)) click 1; sleep 0.3
+[ "$(sel)" = 0 ] || fail "a click left $(sel) selected"
+echo "band ok"
+
+# A folder held under a drag opens; the drop lands inside it.
+set -- $(item f2.txt); fx=$(($1 + $3 / 2)); fy=$(($2 + $4 / 3))
+set -- $(item deep); dx=$(($1 + $3 / 2)); dy=$(($2 + $4 / 3))
+xdotool mousemove "$fx" "$fy" mousedown 1
+for t in 1 2 3 4 5 6; do xdotool mousemove $((fx + (dx - fx) * t / 6)) "$fy"; sleep 0.05; done
+xdotool mousemove "$dx" "$dy"; sleep 1.4
+grep '^state ' "$SB/band.err" | tail -1 | grep -q "dir $SB/c/deep" || fail "the held folder did not open"
+xdotool mousemove $((dx + 30)) $((dy + 200)); sleep 0.3; xdotool mouseup 1; sleep 1
+[ -f "$SB/c/deep/f2.txt" ] && [ ! -e "$SB/c/f2.txt" ] || fail "drop after opening the folder"
+echo "spring folder ok"
+
+# Many files in the list view: a band from beside a name, held below the
+# window, scrolls on and takes in rows that were out of sight.
+mkdir -p "$SB/many"
+i=0; while [ $i -lt 200 ]; do : > "$SB/many/file$(printf %03d $i)"; i=$((i + 1)); done
+NIRUFM_PLACES=1 "$BIN" "$SB/many" 2>"$SB/many.err" &
+M=$!
+PIDS="$PIDS $M"
+sleep 1.2
+WM=$(xdotool search --pid "$M" | head -1)
+xdotool windowmove "$WM" 0 0; xdotool windowraise "$WM"; sleep 0.4
+xdotool key ctrl+4; sleep 0.5
+grep "^item file000 " "$SB/many.err" | tail -1 > "$SB/row"
+read -r _ _ rx ry rw rh < "$SB/row"
+[ -n "$rx" ] || fail "list rows not found"
+bx=$((rx + rw * 2 / 5)); by=$((ry + rh / 2))
+xdotool mousemove "$bx" "$by" mousedown 1
+geo=$(xdotool getwindowgeometry "$WM" | sed -n 's/.*Geometry: \([0-9]*\)x\([0-9]*\).*/\2/p')
+for y in $((by + 20)) $((by + 60)) $((geo - 20)) $((geo + 10)); do xdotool mousemove "$bx" "$y"; sleep 0.05; done
+sleep 1.5
+n=$(grep '^state ' "$SB/many.err" | tail -1 | awk '{print $2}')
+xdotool mouseup 1; sleep 0.3
+[ "$n" -gt 60 ] || fail "edge scrolling took in only $n rows"
+echo "band with scrolling ok ($n rows)"
 
 # Bookmarks are put in order by dragging them in the side panel.
 mkdir -p "$XDG_CONFIG_HOME/gtk-3.0"

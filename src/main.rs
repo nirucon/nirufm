@@ -2,6 +2,7 @@
 mod app;
 mod apps;
 mod archive;
+mod band;
 mod canvas;
 mod devices;
 mod dir;

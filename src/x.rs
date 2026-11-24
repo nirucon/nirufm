@@ -584,6 +584,65 @@ impl X {
         let _ = self.c.ungrab_pointer(x11rb::CURRENT_TIME);
         let _ = self.c.flush();
     }
+
+    /// A small window that follows the pointer while files are dragged
+    /// (override-redirect: the window manager leaves it alone). Made once
+    /// and kept unmapped between drags.
+    pub fn label_window(&self) -> Option<Window> {
+        let w = self.c.generate_id().ok()?;
+        self.c
+            .create_window(
+                x11rb::COPY_DEPTH_FROM_PARENT,
+                w,
+                self.root,
+                0,
+                0,
+                1,
+                1,
+                0,
+                WindowClass::INPUT_OUTPUT,
+                x11rb::COPY_FROM_PARENT,
+                &CreateWindowAux::new()
+                    .override_redirect(1)
+                    .save_under(1)
+                    .background_pixel(0),
+            )
+            .ok()?;
+        Some(w)
+    }
+
+    /// Show `cv` in the label window at root (x, y).
+    pub fn show_label(&self, w: Window, x: i32, y: i32, cv: Option<&Canvas>) {
+        let mut aux = ConfigureWindowAux::new()
+            .x(x)
+            .y(y)
+            .stack_mode(StackMode::ABOVE);
+        if let Some(cv) = cv {
+            aux = aux.width(cv.w as u32).height(cv.h as u32);
+        }
+        let _ = self.c.configure_window(w, &aux);
+        let _ = self.c.map_window(w);
+        if let Some(cv) = cv {
+            let _ = self.c.put_image(
+                ImageFormat::Z_PIXMAP,
+                w,
+                self.gc,
+                cv.w as u16,
+                cv.h as u16,
+                0,
+                0,
+                0,
+                self.depth,
+                cv.as_bytes(),
+            );
+        }
+        let _ = self.c.flush();
+    }
+
+    pub fn hide_label(&self, w: Window) {
+        let _ = self.c.unmap_window(w);
+        let _ = self.c.flush();
+    }
 }
 
 pub fn file_uri(p: &std::path::Path) -> String {

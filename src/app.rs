@@ -194,6 +194,20 @@ pub struct App {
     drag_in: Option<DragIn>,
     drop_target: Option<DropAt>,
     dropped_files: Option<Vec<PathBuf>>,
+    /// A rubber band being drawn over the files.
+    band: Option<crate::band::Band>,
+    /// Pixels per step the folder scrolls while a band or a drag is held at
+    /// its edge, and when the next step is due.
+    edge: i32,
+    edge_next: Option<Instant>,
+    /// The pointer during a band or a drag over this window.
+    pointer: (i32, i32),
+    /// A folder held under a drag opens after a moment.
+    spring: Option<(DropAt, Instant)>,
+    /// The label that follows the pointer while files are dragged, and what
+    /// it says (it is redrawn only when that changes).
+    label_win: Option<u32>,
+    label_text: String,
     /// Remembered view per folder: view, zoom, sort, reverse.
     folders: std::collections::HashMap<PathBuf, (View, usize, SortKey, bool)>,
     gallery: Option<Gallery>,
@@ -236,6 +250,10 @@ struct Gallery {
 }
 
 const SLIDE: Duration = Duration::from_secs(4);
+/// How often the folder scrolls while a band or drag is held at its edge.
+const EDGE_STEP: Duration = Duration::from_millis(25);
+/// How long a folder is held under a drag before it opens.
+const SPRING: Duration = Duration::from_millis(800);
 
 /// Files being dragged out of this window.
 struct DragOut {
@@ -473,6 +491,13 @@ impl App {
             drag_in: None,
             drop_target: None,
             dropped_files: None,
+            band: None,
+            edge: 0,
+            edge_next: None,
+            pointer: (0, 0),
+            spring: None,
+            label_win: None,
+            label_text: String::new(),
             folders: load_folders(),
             gallery: None,
             search_edit: None,
@@ -978,6 +1003,12 @@ impl App {
                     self.gallery_step(1, true);
                 }
             }
+            if self.edge != 0 {
+                self.edge_step();
+            }
+            if self.spring.is_some() {
+                self.spring_open();
+            }
             if self
                 .message
                 .as_ref()
@@ -1002,12 +1033,32 @@ impl App {
                 // For the end-to-end test: where the side panel rows are.
                 if std::env::var_os("NIRUFM_PLACES").is_some() {
                     for (r, h) in &self.hits {
-                        if let Hit::Place(i) = h {
-                            if let Some(pl) = self.places.get(*i) {
-                                eprintln!("place {} {} {}", pl.label, r.x + r.w / 2, r.y + r.h / 2);
+                        match h {
+                            Hit::Place(i) => {
+                                if let Some(pl) = self.places.get(*i) {
+                                    eprintln!(
+                                        "place {} {} {}",
+                                        pl.label,
+                                        r.x + r.w / 2,
+                                        r.y + r.h / 2
+                                    );
+                                }
                             }
+                            Hit::Item(i) => {
+                                if let Some(e) = self.tab().entry(*i) {
+                                    eprintln!("item {} {} {} {} {}", e.label, r.x, r.y, r.w, r.h);
+                                }
+                            }
+                            _ => {}
                         }
                     }
+                    let t = self.tab();
+                    eprintln!(
+                        "state {} selected {} dir {}",
+                        t.selected.iter().filter(|s| **s).count(),
+                        t.shown.len(),
+                        t.path.display()
+                    );
                 }
                 continue;
             }
@@ -1022,6 +1073,16 @@ impl App {
             }
             if let Some(t) = self.gallery.as_ref().and_then(|g| g.slideshow) {
                 let left = SLIDE.saturating_sub(t.elapsed()).as_millis() as i32 + 1;
+                timeout = if timeout < 0 { left } else { timeout.min(left) };
+            }
+            if self.edge != 0 {
+                let left = self.edge_next.map_or(0, |t| {
+                    t.saturating_duration_since(Instant::now()).as_millis() as i32
+                }) + 1;
+                timeout = if timeout < 0 { left } else { timeout.min(left) };
+            }
+            if let Some((_, t)) = &self.spring {
+                let left = t.saturating_duration_since(Instant::now()).as_millis() as i32 + 1;
                 timeout = if timeout < 0 { left } else { timeout.min(left) };
             }
             if let Some((_, t)) = &self.message {
@@ -1138,6 +1199,10 @@ impl App {
             }
             Event::MotionNotify(e) if self.place_press.is_some() => {
                 self.place_motion(e.event_x as i32, e.event_y as i32)
+            }
+            Event::ButtonRelease(e) if e.detail == 1 && self.band.is_some() => self.band_release(),
+            Event::MotionNotify(e) if self.band.is_some() => {
+                self.band_motion(e.event_x as i32, e.event_y as i32)
             }
             Event::ButtonRelease(e) if e.detail == 1 => self.release(
                 e.event_x as i32,
@@ -1302,7 +1367,13 @@ impl App {
             9 => return self.forward(),
             _ => {}
         }
-        let Some(h) = self.hit(x, y) else { return };
+        let Some(mut h) = self.hit(x, y) else { return };
+        // Beside a file's picture and name is room to start a band.
+        if let Hit::Item(i) = h {
+            if b == 1 && !self.item_body(i).contains(x, y) {
+                h = Hit::Content;
+            }
+        }
         match (b, h) {
             // A bookmark opens when the button is released, so it can be
             // dragged to another place in the list first.
@@ -1397,7 +1468,7 @@ impl App {
                     }
                 }
             }
-            (1, Hit::Content) if !ctrl && !shift => self.clear_selection(),
+            (1, Hit::Content) => self.start_band(x, y, ctrl, shift),
             _ => {}
         }
     }
@@ -1409,6 +1480,12 @@ impl App {
         let alt = state.contains(KeyButMask::MOD1);
         if self.gallery.is_some() {
             return self.gallery_key(sym, ctrl);
+        }
+        if sym == 0xff1b && self.band.is_some() {
+            return self.band_cancel();
+        }
+        if sym == 0xff1b && self.drag.is_some() {
+            return self.drag_cancel();
         }
         if self.help && sym != 0xffbe {
             self.help = false;
@@ -2309,6 +2386,7 @@ impl App {
             View::List => self.draw_list(),
             _ => self.draw_icons(),
         }
+        self.draw_band();
         self.draw_scrollbar();
         self.cv.reset_clip();
     }
@@ -2657,6 +2735,16 @@ impl App {
                 small,
                 p.foreground,
             );
+        } else if self.drag.is_some() || self.band.as_ref().is_some_and(|b| b.live) {
+            let hint = if self.drag.is_some() {
+                "Ctrl copies · Shift moves · hold over a folder to open it · Esc cancels"
+                    .to_string()
+            } else {
+                format!("{nsel} selected · Ctrl adds · Shift flips · Esc undoes")
+            };
+            let hint = self.text.ellipsize(&hint, small, r.w * 3 / 4);
+            self.text
+                .draw(&mut self.cv, r.x + pad, ty, &hint, small, p.accent);
         } else if let Some(m) = msg {
             let col = if self.error { p.error } else { p.accent };
             self.text.draw(&mut self.cv, r.x + pad, ty, &m, small, col);
@@ -4367,13 +4455,18 @@ impl App {
                 d.accepted = false;
             }
         }
+        self.pointer = (x, y);
         if own {
             let at = self.drop_at(x, y, &files);
-            if at != self.drop_target {
-                self.drop_target = at;
-                self.dirty = true;
-            }
+            self.set_drop_target(at);
+            self.edge = if self.content.x <= x && x < self.content.x + self.content.w {
+                self.edge_speed_at(y)
+            } else {
+                0
+            };
         } else {
+            self.edge = 0;
+            self.spring = None;
             if self.drop_target.take().is_some() {
                 self.dirty = true;
             }
@@ -4388,6 +4481,7 @@ impl App {
                 self.x.send_client(w, a.2, [win, 0, pos, 0, action]);
             }
         }
+        self.drag_label(rx, ry, state);
     }
 
     fn release(&mut self, x: i32, y: i32, _rx: i16, _ry: i16, state: KeyButMask) {
@@ -4399,6 +4493,10 @@ impl App {
             return;
         };
         self.x.ungrab();
+        self.hide_drag_label();
+        self.spring = None;
+        self.edge = 0;
+        self.edge_next = None;
         let win = self.x.win;
         match d.target {
             Some((w, _)) if w == win => {
@@ -4506,21 +4604,32 @@ impl App {
             let (rx, ry) = ((d[2] >> 16) as i16, (d[2] & 0xffff) as i16);
             let (wx, wy) = self.x.to_window(rx, ry);
             let (src, offered) = (din.source, din.files_offered);
+            let mv = din.move_offered;
             let at = if offered {
                 self.drop_at(wx, wy, &[])
             } else {
                 None
             };
-            if at != self.drop_target {
-                self.drop_target = at.clone();
-                self.dirty = true;
-            }
+            self.pointer = (wx, wy);
+            self.edge = if at.is_some() {
+                self.edge_speed_at(wy)
+            } else {
+                0
+            };
             let accept = u32::from(at.is_some());
+            self.set_drop_target(at);
+            let action = if mv {
+                self.x.atoms.xdnd_move
+            } else {
+                self.x.atoms.xdnd_copy
+            };
             // Bit 1: keep sending positions, the target changes per item.
             self.x
-                .send_client(src, a.2, [win, accept | 2, 0, 0, self.x.atoms.xdnd_copy]);
+                .send_client(src, a.2, [win, accept | 2, 0, 0, action]);
         } else if t == a.3 {
             self.drag_in = None;
+            self.spring = None;
+            self.edge = 0;
             if self.drop_target.take().is_some() {
                 self.dirty = true;
             }
@@ -4548,7 +4657,11 @@ impl App {
     fn drop_data(&mut self, property: u32) {
         let din = self.drag_in.take();
         let at = self.drop_target.take();
+        self.spring = None;
+        self.edge = 0;
         self.dirty = true;
+        // The other program asked for a move (usually Shift held there).
+        let mv = din.as_ref().is_some_and(|d| d.move_offered);
         let win = self.x.win;
         let mut ok = false;
         if property != x11rb::NONE {
@@ -4563,13 +4676,17 @@ impl App {
                 let (files, _) = crate::x::parse_uris(&data);
                 if !files.is_empty() {
                     ok = true;
-                    self.drop_files(files, dest, true, false);
+                    self.drop_files(files, dest, !mv, mv);
                 }
             }
         }
         if let Some(d) = din {
             let _ = d.version;
-            let action = if ok { self.x.atoms.xdnd_copy } else { 0 };
+            let action = match (ok, mv) {
+                (false, _) => 0,
+                (true, true) => self.x.atoms.xdnd_move,
+                (true, false) => self.x.atoms.xdnd_copy,
+            };
             self.x.send_client(
                 d.source,
                 self.x.atoms.xdnd_finished,
@@ -5778,6 +5895,9 @@ impl App {
                     ("Ctrl+Shift+N", "new folder"),
                     ("Alt+Enter", "properties"),
                     ("right-click", "menu: open with, pack, links"),
+                    ("drag on blank space", "select (Ctrl adds, Shift flips)"),
+                    ("drag files", "move (Ctrl copies, Shift moves)"),
+                    ("hold over a folder", "opens it while dragging"),
                 ],
             ),
             (
@@ -6020,6 +6140,388 @@ pub(crate) fn spawn(cmd: &str, args: &[&std::ffi::OsStr], cwd: Option<&Path>) {
         std::thread::spawn(move || {
             let _ = child.wait();
         });
+    }
+}
+
+// ------------------------------------------------------------ rubber band
+
+impl App {
+    /// The part of an item's cell its picture and name take up; the rest of
+    /// the cell is room to start a band, as between the files.
+    fn item_body(&mut self, i: usize) -> Rect {
+        let r = self.item_rect(i);
+        let Some(label) = self.tab().entry(i).map(|e| e.label.clone()) else {
+            return r;
+        };
+        let (pad, font) = (self.m.pad, self.m.font);
+        match self.view {
+            View::List => {
+                let si = self.m.small_icon;
+                let name_w = self.list_name_w();
+                let tw = self.text.width(&label, font).min(name_w - si - 2 * pad);
+                Rect::new(r.x, r.y, (2 * pad + si + tw + pad).min(r.w), r.h)
+            }
+            View::Compact => {
+                let icon = self.m.small_icon;
+                let tw = self.text.width(&label, font).min(r.w - icon - 2 * pad);
+                Rect::new(r.x, r.y, (pad + icon + tw + pad).min(r.w), r.h)
+            }
+            _ => {
+                let (cell_w, _, _) = self.grid();
+                let pic = self.picture_size().max(self.m.icon);
+                let tw = self.text.width(&label, font).min(cell_w - pad);
+                let w = (pic.max(tw) + pad).min(r.w);
+                Rect::new(r.x + (r.w - w) / 2, r.y + pad / 2, w, r.h - pad)
+            }
+        }
+    }
+
+    /// The width of the Name column of the list view.
+    fn list_name_w(&mut self) -> i32 {
+        let (pad, small) = (self.m.pad, self.m.small);
+        let c = self.content;
+        let size_w = self.text.width("0000 MB", small) + 2 * pad;
+        let date_w = self.text.width("2026-11-21 18:04", small) + 2 * pad;
+        let type_w = (c.w / 5).clamp((90.0 * self.m.s) as i32, (240.0 * self.m.s) as i32);
+        c.w - size_w - date_w - type_w - pad
+    }
+
+    fn start_band(&mut self, x: i32, y: i32, ctrl: bool, shift: bool) {
+        use crate::band::{Band, Mode};
+        let mode = if shift {
+            Mode::Toggle
+        } else if ctrl {
+            Mode::Add
+        } else {
+            Mode::Replace
+        };
+        let scroll = self.tab().scroll;
+        let before = self.tab().selected.clone();
+        self.band = Some(Band::new(self.active, (x, y + scroll), before, mode));
+        self.pointer = (x, y);
+    }
+
+    fn band_motion(&mut self, x: i32, y: i32) {
+        self.pointer = (x, y);
+        let far = (6.0 * self.m.s) as i32;
+        let Some(b) = self.band.as_mut() else { return };
+        b.to = (x, y);
+        if !b.live {
+            let scroll = self.tabs.get(b.tab).map_or(0, |t| t.scroll);
+            let (fx, fy) = (b.from.0, b.from.1 - scroll);
+            if (x - fx).abs() <= far && (y - fy).abs() <= far {
+                return;
+            }
+            b.live = true;
+            self.hover = None;
+        }
+        self.edge = self.edge_speed_at(y);
+        self.band_update();
+    }
+
+    /// Select what the band covers now. Only the rows it spans are looked at.
+    fn band_update(&mut self) {
+        let Some(b) = self.band.as_ref() else { return };
+        if !b.live || b.tab != self.active || b.before.len() != self.tab().shown.len() {
+            return;
+        }
+        let scroll = self.tab().scroll;
+        let r = b.rect(scroll);
+        let n = self.tab().shown.len();
+        let c = self.content;
+        // The candidates: the items in the rows the band spans.
+        let candidates: Vec<usize> = match self.view {
+            View::List => {
+                let row_h = self.m.row_h;
+                crate::band::rows(r.y, r.y + r.h, c.y + row_h, row_h, n)
+                    .map(|(a, z)| (a..=z).collect())
+                    .unwrap_or_default()
+            }
+            _ => {
+                let (cw, ch, _) = self.grid();
+                let cols = self.cols.max(1) as usize;
+                let total = n.div_ceil(cols);
+                match crate::band::rows(r.y, r.y + r.h, c.y + self.m.pad, ch, total) {
+                    Some((a, z)) => {
+                        let left = c.x + self.m.pad;
+                        let c0 = ((r.x - left).max(0) / cw.max(1)) as usize;
+                        let c1 = (((r.x + r.w - left).max(0) / cw.max(1)) as usize).min(cols - 1);
+                        (a..=z)
+                            .flat_map(|row| (c0..=c1).map(move |col| row * cols + col))
+                            .filter(|i| *i < n)
+                            .collect()
+                    }
+                    None => Vec::new(),
+                }
+            }
+        };
+        let mut hit = vec![false; n];
+        let mut last = None;
+        for i in candidates {
+            // A list row is taken whole: the band need only cross it.
+            let mut body = if self.view == View::List {
+                Rect::new(r.x, self.item_rect(i).y, r.w, self.m.row_h)
+            } else {
+                self.item_body(i)
+            };
+            body.y += scroll;
+            if crate::band::overlaps(&body, &r) {
+                hit[i] = true;
+                last = Some(i);
+            }
+        }
+        let Some(b) = self.band.as_ref() else { return };
+        let new = crate::band::combine(&b.before, &hit, b.mode);
+        let t = self.tab_mut();
+        if new != t.selected {
+            t.selected = new;
+        }
+        if let Some(i) = last {
+            t.cursor = i;
+            t.anchor = i;
+        }
+        // The band itself moved: it is drawn again either way.
+        self.dirty = true;
+    }
+
+    /// A click on blank space (no band drawn) clears the selection, as before.
+    fn band_release(&mut self) {
+        let Some(b) = self.band.take() else { return };
+        self.edge = 0;
+        self.edge_next = None;
+        if !b.live && b.mode == crate::band::Mode::Replace {
+            self.clear_selection();
+        }
+        self.dirty = true;
+    }
+
+    /// Esc during a band: the selection goes back to what it was.
+    fn band_cancel(&mut self) {
+        if let Some(b) = self.band.take() {
+            let t = self.tab_mut();
+            if b.before.len() == t.selected.len() {
+                t.selected = b.before;
+            }
+        }
+        self.edge = 0;
+        self.edge_next = None;
+        self.dirty = true;
+    }
+
+    fn draw_band(&mut self) {
+        let Some(b) = self.band.as_ref() else { return };
+        if !b.live || b.tab != self.active {
+            return;
+        }
+        let mut r = b.rect(self.tab().scroll);
+        r.y -= self.tab().scroll;
+        let p = self.p;
+        self.cv.tint(r, p.accent, 64);
+        self.cv
+            .dashed(r, p.accent, (3.0 * self.m.s).max(2.0) as i32);
+    }
+
+    /// How fast to scroll for the pointer at `y`: near the top or bottom of
+    /// the folder (under the list's header), or past them.
+    fn edge_speed_at(&self, y: i32) -> i32 {
+        let c = self.content;
+        let top = c.y
+            + if self.view == View::List {
+                self.m.row_h
+            } else {
+                0
+            };
+        let zone = (self.m.row_h * 3 / 2).max(12);
+        let max = (self.content_height() - c.h).max(0);
+        let s = self.tab().scroll;
+        let v = crate::band::edge_speed(y, top, c.y + c.h, zone);
+        // Nothing to scroll that way: no timer either.
+        if (v < 0 && s <= 0) || (v > 0 && s >= max) {
+            0
+        } else {
+            v
+        }
+    }
+
+    /// One step of scrolling at the edge, while a band or drag is held there.
+    fn edge_step(&mut self) {
+        if self.edge == 0 {
+            self.edge_next = None;
+            return;
+        }
+        let now = Instant::now();
+        if self.edge_next.is_some_and(|t| now < t) {
+            return;
+        }
+        self.edge_next = Some(now + EDGE_STEP);
+        let before = self.tab().scroll;
+        self.tab_mut().scroll += self.edge;
+        self.clamp_scroll();
+        if self.tab().scroll == before {
+            self.edge = 0;
+            self.edge_next = None;
+            return;
+        }
+        let (x, y) = self.pointer;
+        if self.band.is_some() {
+            self.band_update();
+        } else if self.drag.is_some() || self.drag_in.is_some() {
+            let files = self
+                .drag
+                .as_ref()
+                .map(|d| d.files.clone())
+                .unwrap_or_default();
+            let at = self.drop_at(x, y, &files);
+            self.set_drop_target(at);
+        }
+        self.edge = self.edge_speed_at(y);
+        self.dirty = true;
+    }
+
+    /// Where a drop would land now; a folder held there long enough opens.
+    fn set_drop_target(&mut self, at: Option<DropAt>) {
+        if at != self.drop_target {
+            self.spring = match &at {
+                Some(DropAt::Here) | None => None,
+                Some(a) => Some((a.clone(), Instant::now() + SPRING)),
+            };
+            self.drop_target = at;
+            self.dirty = true;
+        }
+    }
+
+    /// The folder under a drag has been held long enough: open it, so the
+    /// drop can go further down.
+    fn spring_open(&mut self) {
+        let Some((at, when)) = self.spring.clone() else {
+            return;
+        };
+        if Instant::now() < when || self.drop_target.as_ref() != Some(&at) {
+            return;
+        }
+        self.spring = None;
+        match at {
+            DropAt::Item(i) => {
+                if let Some(e) = self.tab().entry(i).filter(|e| e.is_dir).cloned() {
+                    self.go(e.path);
+                }
+            }
+            DropAt::Place(i) => self.open_place(i),
+            DropAt::Tab(i) => self.switch(i),
+            DropAt::Here => {}
+        }
+        self.drop_target = Some(DropAt::Here);
+        self.dirty = true;
+    }
+
+    /// The label beside the pointer: how many files and what a drop does.
+    fn drag_label(&mut self, rx: i16, ry: i16, state: KeyButMask) {
+        let Some(d) = self.drag.as_ref() else { return };
+        let n = d.files.len();
+        let what = if n == 1 {
+            d.files[0]
+                .file_name()
+                .map(|f| f.to_string_lossy().into_owned())
+                .unwrap_or_default()
+        } else {
+            format!("{n} items")
+        };
+        let own = d.target.is_some_and(|(w, _)| w == self.x.win);
+        let verb = if own {
+            match self.drop_target.as_ref().and_then(|a| self.drop_dir(a)) {
+                Some(dest) => {
+                    use std::os::unix::fs::MetadataExt;
+                    let ctrl = state.contains(KeyButMask::CONTROL);
+                    let shift = state.contains(KeyButMask::SHIFT);
+                    let same_fs = std::fs::metadata(&dest).ok().map(|m| m.dev())
+                        == std::fs::symlink_metadata(&d.files[0]).ok().map(|m| m.dev());
+                    let name = dest
+                        .file_name()
+                        .map(|f| f.to_string_lossy().into_owned())
+                        .unwrap_or_else(|| "/".into());
+                    if d.files[0].parent() == Some(dest.as_path()) {
+                        String::new()
+                    } else if shift || (same_fs && !ctrl) {
+                        format!("move to {name}")
+                    } else {
+                        format!("copy to {name}")
+                    }
+                }
+                None => String::new(),
+            }
+        } else if d.accepted {
+            if state.contains(KeyButMask::SHIFT) {
+                "move".into()
+            } else {
+                "copy".into()
+            }
+        } else {
+            String::new()
+        };
+        let text = if verb.is_empty() {
+            what
+        } else {
+            format!("{what} · {verb}")
+        };
+        if self.label_win.is_none() {
+            self.label_win = self.x.label_window();
+        }
+        let Some(w) = self.label_win else { return };
+        let (lx, ly) = (rx as i32 + 18, ry as i32 + 20);
+        if text == self.label_text {
+            self.x.show_label(w, lx, ly, None);
+            return;
+        }
+        let (small, pad) = (self.m.small, self.m.pad);
+        let text = self.text.ellipsize(&text, small, (360.0 * self.m.s) as i32);
+        let u = (2.0 * self.m.s).max(2.0) as i32;
+        let tw = self.text.width(&text, small);
+        let (cw, ch) = (tw + 2 * pad + 3 * u, small.height + pad);
+        let mut cv = crate::canvas::Canvas::new(cw, ch);
+        let p = self.p;
+        cv.fill(Rect::new(0, 0, cw, ch), p.surface);
+        cv.frame(Rect::new(0, 0, cw, ch), p.accent);
+        // A pixel block of the accent on the left, like a cursor.
+        cv.fill(Rect::new(u, u, u, ch - 2 * u), p.accent);
+        self.text.draw(
+            &mut cv,
+            pad + 2 * u,
+            (ch - small.height) / 2,
+            &text,
+            small,
+            if verb.is_empty() {
+                p.muted
+            } else {
+                p.foreground
+            },
+        );
+        self.label_text = text;
+        self.x.show_label(w, lx, ly, Some(&cv));
+    }
+
+    fn hide_drag_label(&mut self) {
+        if let Some(w) = self.label_win {
+            self.x.hide_label(w);
+        }
+        self.label_text.clear();
+    }
+
+    /// Esc during a drag out of this window: nothing is dropped.
+    fn drag_cancel(&mut self) {
+        let Some(d) = self.drag.take() else { return };
+        self.x.ungrab();
+        if let Some((w, _)) = d.target.filter(|t| t.0 != self.x.win) {
+            self.x
+                .send_client(w, self.x.atoms.xdnd_leave, [self.x.win, 0, 0, 0, 0]);
+        }
+        self.press = None;
+        self.drop_target = None;
+        self.spring = None;
+        self.edge = 0;
+        self.edge_next = None;
+        self.hide_drag_label();
+        self.flash("Drag cancelled".into());
+        self.dirty = true;
     }
 }
 
