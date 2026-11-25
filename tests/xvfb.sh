@@ -259,4 +259,25 @@ k ctrl+v Escape
 sleep 0.5
 [ "$(ls "$SB/t/beta" | wc -l)" = 2 ] || fail "Esc in the question: $(ls "$SB/t/beta")"
 echo "name conflicts ok"
+
+# New items: an empty file (Ctrl+Alt+N) and one from ~/Templates (the menu
+# on blank space), each straight into renaming with its stem selected.
+mkdir -p "$HOME/Templates"; echo Dear > "$HOME/Templates/Letter.txt"
+k ctrl+alt+n
+xdotool type --delay 40 "todo"
+k Return
+[ -f "$SB/t/beta/todo" ] || fail "new empty file: $(ls "$SB/t/beta")"
+xdotool mousemove 700 600 click 3; sleep 0.4
+k Down Down Down Down Return
+field Rename | grep -q 'cursor 6 anchor 0 text Letter.txt$' || fail "template rename: $(field Rename)"
+xdotool type --delay 40 "Memo"
+k Return
+[ "$(cat "$SB/t/beta/Memo.txt")" = Dear ] || fail "new from a template: $(ls "$SB/t/beta")"
+k ctrl+z
+sleep 0.5
+[ -f "$SB/t/beta/Letter.txt" ] && [ ! -e "$SB/t/beta/Memo.txt" ] || fail "undo of the name"
+k ctrl+z
+sleep 0.5
+[ ! -e "$SB/t/beta/Letter.txt" ] || fail "undo of a new file"
+echo "new items ok"
 echo "PASS"

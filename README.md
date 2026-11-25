@@ -54,6 +54,10 @@ Measured on the same machine in the same X server (Debian 13). A folder of
   several items finds and replaces in their names, with `{n}` for a running
   number and a preview of the new names. The path bar (Ctrl+L), search
   (Ctrl+F) and the Connect form are the same kind of field.
+- **New items** from the menu on blank space: a folder (Ctrl+Shift+N), an
+  empty file (Ctrl+Alt+N) or a copy of any file in `~/Templates` (or the
+  folder `XDG_TEMPLATES_DIR` names in `user-dirs.dirs`). The new item opens
+  in renaming with its name selected.
 - **Clipboard** shared with other file managers, and **drag and drop** in and
   out (XDND), onto folders, places, tabs and the other pane. A label beside
   the pointer says how many files and whether they move or copy, a folder
@@ -91,7 +95,7 @@ Press F1 in the window for every key. The most used:
 | Enter, double-click | open (photos open in the gallery) |
 | Backspace, Alt+Left, Alt+Right | parent, back, forward |
 | Ctrl+C, Ctrl+X, Ctrl+V, Delete, Ctrl+Z | copy, cut, paste, trash, undo |
-| F2, Ctrl+Shift+N | rename, new folder |
+| F2, Ctrl+Shift+N, Ctrl+Alt+N | rename, new folder, new file |
 | Space, Ctrl+G | preview, gallery |
 | Ctrl+F, Ctrl+L | search, type a path |
 | Ctrl+T, F3 | new tab, two panes |

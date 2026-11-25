@@ -204,6 +204,8 @@ pub struct App {
     side_total: i32,
     apps: Option<crate::apps::Apps>,
     menu_apps: Vec<crate::apps::App>,
+    /// The templates the open menu lists.
+    menu_templates: Vec<PathBuf>,
     press: Option<(i32, i32)>,
     single_on_release: Option<usize>,
     drag: Option<DragOut>,
@@ -405,6 +407,9 @@ enum Act {
     PackZip,
     PackTar,
     NewFolder,
+    NewFile,
+    /// A copy of the template at this place in `menu_templates`.
+    NewFrom(u8),
     Terminal,
     Hidden,
     CopyPath,
@@ -564,6 +569,7 @@ impl App {
             side_total: 0,
             apps: None,
             menu_apps: Vec::new(),
+            menu_templates: Vec::new(),
             press: None,
             single_on_release: None,
             drag: None,
@@ -1747,6 +1753,7 @@ impl App {
                 let any = !self.tab().shown.is_empty();
                 self.open_menu(r.x + r.w / 2, r.y + r.h / 2, any);
             }
+            0x6e | 0x4e if ctrl && alt => self.act(Act::NewFile), // Ctrl+Alt+N
             0xff0d | 0xff8d => {
                 if alt {
                     return self.open_props();
@@ -3236,19 +3243,27 @@ impl App {
                 let out = crate::ops::free_name(&here, Path::new(&format!("{base}{ext}")));
                 self.submit(crate::ops::Job::Compress { paths: sel, out });
             }
+            Act::NewFolder | Act::NewFile | Act::NewFrom(_) if self.in_trash() => {
+                self.flash_error("New items cannot be made in the trash".into());
+            }
             Act::NewFolder => {
                 let p = crate::ops::free_name(&here, Path::new("New folder"));
                 match std::fs::create_dir(&p) {
-                    Ok(()) => {
-                        self.undo
-                            .push(crate::ops::Undo::TrashCreated(vec![p.clone()]));
-                        let a = self.active;
-                        self.load_tab(a, false);
-                        self.select_after = vec![p];
-                        self.apply_select_after();
-                        self.act(Act::Rename);
-                    }
+                    Ok(()) => self.created_new(p),
                     Err(e) => self.flash_error(format!("Could not create the folder: {e}")),
+                }
+            }
+            Act::NewFile => match crate::templates::create_empty(&here) {
+                Ok(p) => self.created_new(p),
+                Err(e) => self.flash_error(crate::templates::error(&e)),
+            },
+            Act::NewFrom(k) => {
+                let Some(t) = self.menu_templates.get(k as usize).cloned() else {
+                    return;
+                };
+                match crate::templates::create_from(&t, &here) {
+                    Ok(p) => self.created_new(p),
+                    Err(e) => self.flash_error(crate::templates::error(&e)),
                 }
             }
             Act::Terminal => open_terminal(&here),
@@ -3448,6 +3463,18 @@ impl App {
         };
         let (files, cut) = crate::x::parse_uris(&data);
         self.paste_files(files, cut);
+    }
+
+    /// A new folder or file: an undo step, then straight into renaming it
+    /// with the name before the extension selected.
+    fn created_new(&mut self, p: PathBuf) {
+        self.undo
+            .push(crate::ops::Undo::TrashCreated(vec![p.clone()]));
+        let a = self.active;
+        self.load_tab(a, false);
+        self.select_after = vec![p];
+        self.apply_select_after();
+        self.start_rename();
     }
 
     /// An undo step from a finished job.
@@ -4116,6 +4143,15 @@ impl App {
             if !trash {
                 items.push(("Paste".into(), Act::Paste, "Ctrl+V"));
                 items.push(("New folder".into(), Act::NewFolder, "Ctrl+Shift+N"));
+                items.push(("New empty file".into(), Act::NewFile, "Ctrl+Alt+N"));
+                self.menu_templates = crate::templates::dir()
+                    .map(|d| crate::templates::list(&d))
+                    .unwrap_or_default();
+                self.menu_templates.truncate(crate::templates::MAX);
+                for (k, t) in self.menu_templates.iter().enumerate() {
+                    let name = t.file_name().unwrap_or_default().to_string_lossy();
+                    items.push((format!("New {name}"), Act::NewFrom(k as u8), "template"));
+                }
             } else {
                 items.push(("Empty the trash".into(), Act::EmptyTrash, ""));
             }
@@ -6758,6 +6794,7 @@ impl App {
                     ),
                     ("F2", "rename (several: find, replace, {n})"),
                     ("Ctrl+Shift+N", "new folder"),
+                    ("Ctrl+Alt+N", "new empty file (templates: menu)"),
                     ("Alt+Enter", "properties"),
                     ("right-click", "menu: open with, pack, links"),
                     ("drag on blank space", "select (Ctrl adds, Shift flips)"),

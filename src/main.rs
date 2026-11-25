@@ -15,6 +15,7 @@ mod nextcloud;
 mod ops;
 mod places;
 mod remote;
+mod templates;
 mod text;
 mod theme;
 mod thumbs;
@@ -31,7 +32,7 @@ Keys: Enter open · Backspace up · Alt+Left/Right back/forward
       Ctrl+T new tab · Ctrl+W close tab · Ctrl+Tab next tab
       Ctrl+L type a path (Tab completes) · Ctrl+H hidden files
       Ctrl+1 icons · Ctrl+2 list · Ctrl+A select all · F4 terminal
-      Ctrl+Shift+N new folder · F5 reload · type to find
+      Ctrl+Shift+N new folder · Ctrl+Alt+N new file · F5 reload
 Mouse: double-click open · middle-click folder or place: new tab
        middle-click a tab: close · back/forward buttons";
 
