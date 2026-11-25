@@ -489,6 +489,37 @@ impl X {
         } else {
             prop = x11rb::NONE;
         }
+        self.notify(e, prop)
+    }
+
+    /// Answer a paste request with text copied from a text field.
+    pub fn answer_text(&self, e: &SelectionRequestEvent, text: &str) -> Res<()> {
+        let a = &self.atoms;
+        let mut prop = if e.property == x11rb::NONE {
+            e.target
+        } else {
+            e.property
+        };
+        if e.target == a.targets {
+            let t = [a.targets, a.utf8, u32::from(AtomEnum::STRING)];
+            self.c
+                .change_property32(PropMode::REPLACE, e.requestor, prop, AtomEnum::ATOM, &t)?;
+        } else if e.target == a.utf8 || e.target == u32::from(AtomEnum::STRING) {
+            self.c.change_property8(
+                PropMode::REPLACE,
+                e.requestor,
+                prop,
+                e.target,
+                text.as_bytes(),
+            )?;
+        } else {
+            prop = x11rb::NONE;
+        }
+        self.notify(e, prop)
+    }
+
+    /// Tell the requestor its answer is in `prop` (NONE: refused).
+    fn notify(&self, e: &SelectionRequestEvent, prop: Atom) -> Res<()> {
         let ev = SelectionNotifyEvent {
             response_type: SELECTION_NOTIFY_EVENT,
             sequence: 0,

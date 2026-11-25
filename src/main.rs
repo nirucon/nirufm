@@ -6,6 +6,7 @@ mod band;
 mod canvas;
 mod devices;
 mod dir;
+mod edit;
 mod exif;
 mod icons;
 mod logo;

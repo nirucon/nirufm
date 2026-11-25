@@ -77,6 +77,33 @@ impl Text {
         s.chars().map(|c| self.advance(c, size)).sum::<f32>().ceil() as i32
     }
 
+    /// The byte offset in `s` nearest to `x` pixels from its start: where
+    /// a click in a text field puts the cursor.
+    pub fn offset_at(&mut self, s: &str, size: Size, x: i32) -> usize {
+        let mut w = 0.0;
+        for (i, c) in s.char_indices() {
+            let a = self.advance(c, size);
+            if x as f32 <= w + a / 2.0 {
+                return i;
+            }
+            w += a;
+        }
+        s.len()
+    }
+
+    /// The byte offset of the character under `x` pixels from the start
+    /// of `s` (its length past the end): what a double-click is on.
+    pub fn char_at(&mut self, s: &str, size: Size, x: i32) -> usize {
+        let mut w = 0.0;
+        for (i, c) in s.char_indices() {
+            w += self.advance(c, size);
+            if (x as f32) < w {
+                return i;
+            }
+        }
+        s.len()
+    }
+
     /// The longest prefix of `s` that fits `max` pixels, with "…" when cut.
     pub fn ellipsize(&mut self, s: &str, size: Size, max: i32) -> String {
         if self.width(s, size) <= max {

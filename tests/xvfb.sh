@@ -45,6 +45,38 @@ k Home F2 ctrl+BackSpace
 xdotool type --delay 40 "bilder"
 k Return
 [ -d "$SB/a/bilder" ] || fail "rename"
+# A file: the name before ".txt" is selected, so typing replaces just that.
+k Right F2
+xdotool type --delay 40 "memo"
+k Return
+[ -f "$SB/a/memo.txt" ] && [ ! -e "$SB/a/notes (2).txt" ] || fail "rename keeps the extension"
+k ctrl+z
+[ -f "$SB/a/notes (2).txt" ] && [ ! -e "$SB/a/memo.txt" ] || fail "undo of a rename"
+# Editing inside the name: End, Left over ".txt", Backspace over " (2)".
+k F2 End Left Left Left Left BackSpace BackSpace BackSpace BackSpace
+k minus
+xdotool type --delay 40 "copy"
+k Return
+[ -f "$SB/a/notes-copy.txt" ] || fail "cursor keys in the rename field"
+k ctrl+z
+# A name that exists is refused and the field stays open to correct it.
+k F2 ctrl+a
+xdotool type --delay 40 "second.txt"
+k Return ctrl+a
+xdotool type --delay 40 "third.txt"
+k Return
+[ -f "$SB/a/third.txt" ] && [ "$(cat "$SB/a/second.txt")" = two ] || fail "rename onto an existing name"
+k ctrl+z
+[ -f "$SB/a/notes (2).txt" ] || fail "undo after a refused name"
+# Several at once: find "notes", replace with a number.
+k shift+Right F2
+xdotool type --delay 40 "notes"
+k Tab
+xdotool type --delay 40 "{n} day"
+k Return
+[ -f "$SB/a/01 day (2).txt" ] && [ -f "$SB/a/02 day.txt" ] || fail "batch rename: $(ls "$SB/a")"
+k ctrl+z Escape
+[ -f "$SB/a/notes (2).txt" ] && [ -f "$SB/a/notes.txt" ] || fail "undo of a batch rename"
 echo "file operations ok"
 
 # Drag "notes (2).txt" (second cell) onto the folder: moved inside.

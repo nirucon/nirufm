@@ -700,6 +700,125 @@ pub fn trash_origin(file: &Path) -> Option<(PathBuf, PathBuf)> {
     Some((info, p))
 }
 
+/// Two paths that are one file: a change of case only on a drive that
+/// ignores case (FAT, exFAT, Windows shares) finds the old file by the new name.
+pub fn same_file(a: &Path, b: &Path) -> bool {
+    match (fs::symlink_metadata(a), fs::symlink_metadata(b)) {
+        (Ok(x), Ok(y)) => x.dev() == y.dev() && x.ino() == y.ino(),
+        _ => false,
+    }
+}
+
+/// Rename in place without ever replacing another file. The kernel checks
+/// and renames in one step (RENAME_NOREPLACE) where the file system can;
+/// elsewhere (FUSE mounts, some network drives) a check just before has to do.
+pub fn rename_noreplace(from: &Path, to: &Path) -> std::io::Result<()> {
+    use std::os::unix::ffi::OsStrExt;
+    if same_file(from, to) {
+        return fs::rename(from, to);
+    }
+    let c = |p: &Path| {
+        std::ffi::CString::new(p.as_os_str().as_bytes())
+            .map_err(|_| std::io::Error::from(std::io::ErrorKind::InvalidInput))
+    };
+    let (f, t) = (c(from)?, c(to)?);
+    let r = unsafe {
+        libc::renameat2(
+            libc::AT_FDCWD,
+            f.as_ptr(),
+            libc::AT_FDCWD,
+            t.as_ptr(),
+            libc::RENAME_NOREPLACE,
+        )
+    };
+    if r == 0 {
+        return Ok(());
+    }
+    let e = std::io::Error::last_os_error();
+    match e.raw_os_error() {
+        Some(libc::EINVAL | libc::ENOSYS | libc::EOPNOTSUPP) => {
+            if fs::symlink_metadata(to).is_ok() {
+                return Err(std::io::ErrorKind::AlreadyExists.into());
+            }
+            fs::rename(from, to)
+        }
+        _ => Err(e),
+    }
+}
+
+/// Rename several items without replacing anything. When one takes a name
+/// another gives up (a to b and b to c, or a swap), all first step aside to
+/// hidden temporary names. A failure returns the renames that were made, so
+/// they can still be undone, and the reason.
+pub fn rename_all(moves: &[(PathBuf, PathBuf)]) -> Result<(), (Vec<(PathBuf, PathBuf)>, String)> {
+    let name = |p: &Path| {
+        p.file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default()
+    };
+    let why = |e: &std::io::Error, f: &Path, t: &Path| rename_error(e, &name(f), &name(t));
+    let sources: std::collections::HashSet<&PathBuf> = moves.iter().map(|m| &m.0).collect();
+    let mut done = Vec::new();
+    if !moves.iter().any(|(f, t)| f != t && sources.contains(t)) {
+        for (f, t) in moves {
+            if let Err(e) = rename_noreplace(f, t) {
+                return Err((done, why(&e, f, t)));
+            }
+            done.push((f.clone(), t.clone()));
+        }
+        return Ok(());
+    }
+    let aside: Vec<PathBuf> = moves
+        .iter()
+        .enumerate()
+        .map(|(k, (f, _))| f.with_file_name(format!(".nirufm-rename-{}-{k}", std::process::id())))
+        .collect();
+    for (k, (f, t)) in moves.iter().enumerate() {
+        if let Err(e) = rename_noreplace(f, &aside[k]) {
+            for j in 0..k {
+                let _ = rename_noreplace(&aside[j], &moves[j].0);
+            }
+            return Err((done, why(&e, f, t)));
+        }
+    }
+    let mut failed = None;
+    for (k, (f, t)) in moves.iter().enumerate() {
+        match rename_noreplace(&aside[k], t) {
+            Ok(()) => done.push((f.clone(), t.clone())),
+            Err(e) => {
+                let mut msg = why(&e, f, t);
+                if rename_noreplace(&aside[k], f).is_err() {
+                    msg += &format!(" (kept as {})", name(&aside[k]));
+                }
+                failed.get_or_insert(msg);
+            }
+        }
+    }
+    failed.map_or(Ok(()), |m| Err((done, m)))
+}
+
+/// A failed rename in words: what went wrong and what to do about it.
+pub fn rename_error(e: &std::io::Error, old: &str, new: &str) -> String {
+    match e.raw_os_error() {
+        Some(libc::EEXIST | libc::ENOTEMPTY) => format!("\"{new}\" already exists"),
+        Some(libc::EACCES | libc::EPERM) => {
+            format!("No permission to rename \"{old}\" in this folder")
+        }
+        Some(libc::EROFS) => format!("\"{old}\" is on a read-only drive"),
+        Some(libc::ENOENT) => format!("\"{old}\" is no longer there"),
+        Some(libc::ENAMETOOLONG) => "The name is too long for this drive".into(),
+        Some(libc::EBUSY) => format!("\"{old}\" is in use (a mounted drive?)"),
+        // FAT drives and Windows shares refuse some characters this way.
+        Some(libc::EINVAL | libc::EILSEQ) => {
+            "This drive does not allow that name (try without \\ : * ? \" < > |)".into()
+        }
+        _ if e.kind() == std::io::ErrorKind::AlreadyExists => {
+            format!("\"{new}\" already exists")
+        }
+        _ => format!("Could not rename \"{old}\": {e}"),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -813,5 +932,44 @@ mod tests {
         assert!(errors.is_empty());
         assert!(orig.exists() && !file.exists() && !info.exists());
         fs::remove_dir_all(d).unwrap();
+    }
+
+    #[test]
+    fn rename_never_replaces() {
+        let d = tmp("rename");
+        fs::write(d.join("a"), "a").unwrap();
+        fs::write(d.join("b"), "b").unwrap();
+        let e = rename_noreplace(&d.join("a"), &d.join("b")).unwrap_err();
+        assert!(rename_error(&e, "a", "b").contains("already exists"));
+        assert_eq!(fs::read_to_string(d.join("b")).unwrap(), "b");
+        rename_noreplace(&d.join("a"), &d.join("c")).unwrap();
+        assert!(!d.join("a").exists() && d.join("c").exists());
+        let e = rename_noreplace(&d.join("gone"), &d.join("x")).unwrap_err();
+        assert!(rename_error(&e, "gone", "x").contains("no longer there"));
+        assert!(same_file(&d.join("c"), &d.join("c")));
+        assert!(!same_file(&d.join("b"), &d.join("c")));
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn rename_all_handles_chains_and_swaps() {
+        let d = tmp("rename-all");
+        for n in ["a", "b", "c"] {
+            fs::write(d.join(n), n).unwrap();
+        }
+        let j = |n: &str| d.join(n);
+        // A swap of a and b, and c to a new name.
+        rename_all(&[(j("a"), j("b")), (j("b"), j("a")), (j("c"), j("d"))]).unwrap();
+        assert_eq!(fs::read_to_string(j("a")).unwrap(), "b");
+        assert_eq!(fs::read_to_string(j("b")).unwrap(), "a");
+        assert_eq!(fs::read_to_string(j("d")).unwrap(), "c");
+        // A name that is taken stops it, and what was done is returned.
+        fs::write(j("e"), "e").unwrap();
+        let (done, msg) = rename_all(&[(j("d"), j("f")), (j("a"), j("e"))]).unwrap_err();
+        assert_eq!(done, vec![(j("d"), j("f"))]);
+        assert!(msg.contains("already exists"));
+        assert_eq!(fs::read_to_string(j("e")).unwrap(), "e");
+        assert_eq!(fs::read_dir(&d).unwrap().count(), 4);
+        let _ = fs::remove_dir_all(&d);
     }
 }

@@ -3,6 +3,7 @@
 //! something changed; between events the process sleeps in `poll`.
 use crate::canvas::{Canvas, Rect};
 use crate::dir::{self, Entry, SortKey};
+use crate::edit::Key as EditKey;
 use crate::icons::Icons;
 use crate::mime::Mime;
 use crate::places::{self, Place};
@@ -164,7 +165,12 @@ pub struct App {
     clip: Option<(Vec<PathBuf>, bool)>,
     menu: Option<Menu>,
     confirm: Option<Confirm>,
-    rename: Option<(usize, String)>,
+    rename: Option<Rename>,
+    /// Several items renamed at once.
+    batch: Option<BatchRename>,
+    /// Text copied from a text field; served on the clipboard when no
+    /// files are.
+    clip_text: Option<String>,
     select_after: Vec<PathBuf>,
     zoom: usize,
     font_px: f32,
@@ -183,7 +189,7 @@ pub struct App {
     /// While a bookmark is dragged: the row it would move to.
     place_drag_to: Option<usize>,
     /// A bookmark being renamed in the side panel.
-    place_rename: Option<(usize, String)>,
+    place_rename: Option<(usize, crate::edit::LineEdit)>,
     side_scroll: i32,
     side_total: i32,
     apps: Option<crate::apps::Apps>,
@@ -278,6 +284,33 @@ enum DropAt {
     Place(usize),
     Tab(usize),
     Here,
+}
+
+/// An item's name edited in place.
+struct Rename {
+    /// The item by its path, not its row: a reload while typing (another
+    /// program writing in the folder) can move it in the list.
+    path: PathBuf,
+    ed: crate::edit::LineEdit,
+    /// Pixels the text is scrolled left to keep the cursor in the field.
+    scroll: i32,
+    /// The button is held after a press in the field: drag to select.
+    dragging: bool,
+    /// The last press in the field and how many came in quick succession.
+    clicks: Option<(Instant, u8)>,
+}
+
+/// The dialog for renaming several items: find and replace in the names
+/// before their extensions, with a running number.
+struct BatchRename {
+    paths: Vec<PathBuf>,
+    /// (name, is a folder) of each path.
+    items: Vec<(String, bool)>,
+    find: crate::edit::LineEdit,
+    replace: crate::edit::LineEdit,
+    /// 0 find, 1 replace.
+    field: usize,
+    note: Option<String>,
 }
 
 struct ConnectForm {
@@ -465,6 +498,8 @@ impl App {
             menu: None,
             confirm: None,
             rename: None,
+            batch: None,
+            clip_text: None,
             select_after: Vec::new(),
             zoom: ZOOM_DEFAULT,
             font_px,
@@ -1174,6 +1209,8 @@ impl App {
                     }
                 } else if let Some((files, cut)) = self.clip.clone() {
                     let _ = self.x.answer(&e, &files, cut);
+                } else if let Some(text) = &self.clip_text {
+                    let _ = self.x.answer_text(&e, text);
                 }
             }
             Event::SelectionClear(_) => {}
@@ -1199,6 +1236,16 @@ impl App {
             }
             Event::MotionNotify(e) if self.place_press.is_some() => {
                 self.place_motion(e.event_x as i32, e.event_y as i32)
+            }
+            Event::ButtonRelease(e)
+                if e.detail == 1 && self.rename.as_ref().is_some_and(|r| r.dragging) =>
+            {
+                if let Some(r) = self.rename.as_mut() {
+                    r.dragging = false;
+                }
+            }
+            Event::MotionNotify(e) if self.rename.as_ref().is_some_and(|r| r.dragging) => {
+                self.rename_drag(e.event_x as i32)
             }
             Event::ButtonRelease(e) if e.detail == 1 && self.band.is_some() => self.band_release(),
             Event::MotionNotify(e) if self.band.is_some() => {
@@ -1299,8 +1346,15 @@ impl App {
             self.dirty = true;
             return;
         }
-        if self.rename.is_some() {
-            self.commit_rename();
+        if self.batch.is_some() {
+            return;
+        }
+        if self.rename.is_some() && matches!(b, 1..=3) {
+            if b == 1 && self.rename_press(x, y, shift) {
+                return;
+            }
+            // A click elsewhere applies the name, as in other file managers.
+            self.commit_rename(false);
         }
         if self.place_rename.is_some() {
             self.commit_place_rename();
@@ -1503,6 +1557,9 @@ impl App {
         if self.connect.is_some() {
             return self.connect_key(sym, ctrl, shift);
         }
+        if self.batch.is_some() {
+            return self.batch_key(sym, ctrl, shift);
+        }
         if self.search_edit.is_some() {
             return self.search_key(sym, ctrl);
         }
@@ -1538,10 +1595,10 @@ impl App {
             return;
         }
         if self.rename.is_some() {
-            return self.rename_key(sym, ctrl);
+            return self.rename_key(sym, ctrl, shift);
         }
         if self.place_rename.is_some() {
-            return self.place_rename_key(sym, ctrl);
+            return self.place_rename_key(sym, ctrl, shift);
         }
         if self.preview.is_some() {
             return self.preview_key(sym);
@@ -1978,6 +2035,7 @@ impl App {
         self.draw_help();
         self.draw_confirm();
         self.draw_connect();
+        self.draw_batch();
     }
 
     fn draw_sidebar(&mut self) {
@@ -2051,22 +2109,15 @@ impl App {
                     self.cv.fill(Rect::new(r.x, ly, r.w, lw), p.accent);
                 }
             }
-            if let Some((_, buf)) = self.place_rename.as_ref().filter(|(k, _)| *k == i) {
+            if let Some((_, ed)) = self.place_rename.take_if(|(k, _)| *k == i) {
                 let field = Rect::new(tx - pad / 2, y + 1, sw - tx - pad / 2, row - 2);
                 self.cv.fill(field, p.background);
                 self.cv.fill(
                     Rect::new(field.x, field.y + field.h - 1, field.w, 1),
                     p.accent,
                 );
-                let shown = buf.clone() + "▏";
-                self.text.draw(
-                    &mut self.cv,
-                    tx,
-                    y + (row - font.height) / 2,
-                    &shown,
-                    font,
-                    p.foreground,
-                );
+                self.draw_edit(field, field, &ed, 0, true);
+                self.place_rename = Some((i, ed));
                 y += row;
                 self.hits.push((r, Hit::Place(i)));
                 continue;
@@ -2489,6 +2540,13 @@ impl App {
                 r.y + pad + icon - 6 * u,
             );
             let max_lines = if self.view == View::Thumbs { 1 } else { 2 };
+            // The rename field stands in for the name; a second line of
+            // the old one would show below it.
+            let max_lines = if self.rename.as_ref().is_some_and(|r| r.path == e.path) {
+                0
+            } else {
+                max_lines
+            };
             let lines = self.text.wrap(&e.label, font, cell_w - pad, max_lines);
             let mut ty = r.y + pad + icon + pad / 2;
             for l in lines {
@@ -3007,6 +3065,7 @@ impl App {
                 let cut = a == Act::Cut;
                 let n = sel.len();
                 self.clip = Some((sel, cut));
+                self.clip_text = None;
                 let _ = self.x.own_clipboard();
                 self.flash(format!(
                     "{} {n} item{}",
@@ -3020,6 +3079,7 @@ impl App {
                 }
                 // Paths as text for a terminal; pasting here still copies.
                 self.clip = Some((sel, false));
+                self.clip_text = None;
                 let _ = self.x.own_clipboard();
                 self.flash("Copied the paths".into());
             }
@@ -3032,15 +3092,7 @@ impl App {
                     let _ = self.x.request_clipboard(self.x.atoms.gnome_copied);
                 }
             }
-            Act::Rename => {
-                let t = self.tab();
-                if let Some(e) = t.entry(t.cursor) {
-                    let name = e.name.clone();
-                    let c = t.cursor;
-                    self.rename = Some((c, name));
-                    self.dirty = true;
-                }
-            }
+            Act::Rename => self.start_rename(),
             Act::Trash => {
                 if sel.is_empty() {
                     return;
@@ -3178,7 +3230,9 @@ impl App {
             Act::RenameBookmark => {
                 if let Some(i) = self.menu_place.take() {
                     if let Some(pl) = self.places.get(i) {
-                        self.place_rename = Some((i, pl.label.clone()));
+                        // All selected, so typing replaces the label.
+                        let ed = crate::edit::LineEdit::selecting(&pl.label, 0, pl.label.len());
+                        self.place_rename = Some((i, ed));
                     }
                 }
             }
@@ -3308,6 +3362,15 @@ impl App {
 
     /// The answer to our clipboard request from another program.
     fn pasted(&mut self, target: u32, property: u32) {
+        if target == self.x.atoms.utf8 {
+            // Text a text field asked for (Ctrl+V while renaming).
+            if property != x11rb::NONE {
+                if let Some(data) = self.x.take_selection() {
+                    self.insert_in_field(&String::from_utf8_lossy(&data));
+                }
+            }
+            return;
+        }
         let a = &self.x.atoms;
         if property == x11rb::NONE {
             // No files in that format: try the plain URI list once.
@@ -3332,21 +3395,31 @@ impl App {
         };
         match u {
             crate::ops::Undo::MoveBack(pairs) => {
-                // Each item goes back to its own folder.
-                let mut n = 0;
-                for (now, orig) in pairs {
-                    if std::fs::symlink_metadata(&orig).is_err()
-                        && std::fs::rename(&now, &orig).is_ok()
-                    {
-                        n += 1;
+                // Each item goes back to its own folder (or name), never
+                // over a file that took its place meanwhile.
+                let moves: Vec<(PathBuf, PathBuf)> = pairs
+                    .into_iter()
+                    .filter(|(now, _)| std::fs::symlink_metadata(now).is_ok())
+                    .collect();
+                let done = match crate::ops::rename_all(&moves) {
+                    Ok(()) => {
+                        let n = moves.len();
+                        self.error = false;
+                        self.flash(format!(
+                            "Undone: {n} item{} moved back",
+                            if n == 1 { "" } else { "s" }
+                        ));
+                        moves
                     }
-                }
-                self.flash(format!(
-                    "Undone: {n} item{} moved back",
-                    if n == 1 { "" } else { "s" }
-                ));
+                    Err((done, msg)) => {
+                        self.flash_error(msg);
+                        done
+                    }
+                };
                 let a = self.active;
                 self.load_tab(a, false);
+                self.select_after = done.into_iter().map(|(_, orig)| orig).collect();
+                self.apply_select_after();
             }
             crate::ops::Undo::Untrash(v) => self.submit(crate::ops::Job::Restore { pairs: v }),
             crate::ops::Undo::TrashCreated(v) => {
@@ -3431,35 +3504,34 @@ impl App {
         self.dirty = true;
     }
 
-    fn place_rename_key(&mut self, sym: u32, ctrl: bool) {
-        let Some((_, buf)) = self.place_rename.as_mut() else {
+    fn place_rename_key(&mut self, sym: u32, ctrl: bool, shift: bool) {
+        let ch = keysym_char(sym);
+        let Some((_, ed)) = self.place_rename.as_mut() else {
             return;
         };
-        match sym {
-            0xff1b => self.place_rename = None,
-            0xff0d | 0xff8d => self.commit_place_rename(),
-            0xff08 => {
-                if ctrl {
-                    buf.clear();
-                } else {
-                    buf.pop();
+        match ed.key(sym, ctrl, shift, ch) {
+            EditKey::Commit => self.commit_place_rename(),
+            EditKey::Cancel => self.place_rename = None,
+            EditKey::Copy => {
+                let s = ed.selected().to_string();
+                self.copy_text(s);
+            }
+            EditKey::Cut => {
+                if let Some(s) = ed.cut() {
+                    self.copy_text(s);
                 }
             }
-            _ => {
-                if let Some(c) = keysym_char(sym) {
-                    if !c.is_control() {
-                        buf.push(c);
-                    }
-                }
-            }
+            EditKey::Paste => self.paste_text(),
+            _ => {}
         }
         self.dirty = true;
     }
 
     fn commit_place_rename(&mut self) {
-        let Some((i, name)) = self.place_rename.take() else {
+        let Some((i, ed)) = self.place_rename.take() else {
             return;
         };
+        let name = ed.text;
         self.dirty = true;
         let Some(pl) = self.places.get(i).cloned() else {
             return;
@@ -3477,60 +3549,391 @@ impl App {
         }
     }
 
-    fn rename_key(&mut self, sym: u32, ctrl: bool) {
-        let Some((_, buf)) = self.rename.as_mut() else {
+    /// F2: the name under the cursor in place, several names in a dialog.
+    fn start_rename(&mut self) {
+        if self.in_trash() {
+            // The trash finds an item's way back by its name.
+            self.flash_error("Restore it first to rename it".into());
+            return;
+        }
+        let sel = self.selection_paths();
+        if sel.len() > 1 {
+            return self.start_batch(sel);
+        }
+        let t = self.tab();
+        let Some(e) = t.entry(t.cursor).cloned() else {
             return;
         };
-        match sym {
-            0xff1b => self.rename = None,
-            0xff0d | 0xff8d => self.commit_rename(),
-            0xff08 => {
-                if ctrl {
-                    buf.clear();
-                } else {
-                    buf.pop();
+        // The name without its extension is selected, so typing replaces
+        // just that, as in other file managers.
+        let end = crate::edit::stem_end(&e.name, e.is_dir);
+        self.reveal();
+        self.rename = Some(Rename {
+            path: e.path,
+            ed: crate::edit::LineEdit::selecting(&e.name, 0, end),
+            scroll: 0,
+            dragging: false,
+            clicks: None,
+        });
+        self.dirty = true;
+    }
+
+    /// The row of the item being renamed, if it is still in the list.
+    fn rename_row(&self) -> Option<usize> {
+        let r = self.rename.as_ref()?;
+        let t = self.tab();
+        t.shown.iter().position(|k| t.all[*k].path == r.path)
+    }
+
+    fn rename_key(&mut self, sym: u32, ctrl: bool, shift: bool) {
+        let ch = keysym_char(sym);
+        let Some(rn) = self.rename.as_mut() else {
+            return;
+        };
+        if ch == Some('/') && !ctrl {
+            // Say why nothing appears rather than drop it silently.
+            self.flash_error("A name cannot contain \"/\"".into());
+            return;
+        }
+        match rn.ed.key(sym, ctrl, shift, ch) {
+            EditKey::Commit => {
+                self.commit_rename(true);
+            }
+            EditKey::Cancel => self.rename = None,
+            EditKey::Copy => {
+                let s = rn.ed.selected().to_string();
+                self.copy_text(s);
+            }
+            EditKey::Cut => {
+                if let Some(s) = rn.ed.cut() {
+                    self.copy_text(s);
                 }
             }
-            _ => {
-                if let Some(c) = keysym_char(sym) {
-                    if !c.is_control() && c != '/' {
-                        buf.push(c);
-                    }
-                }
-            }
+            EditKey::Paste => self.paste_text(),
+            EditKey::Next(back) => self.rename_next(back),
+            EditKey::Edited | EditKey::Ignored => {}
         }
         self.dirty = true;
     }
 
-    fn commit_rename(&mut self) {
-        let Some((i, name)) = self.rename.take() else {
+    /// Apply the typed name. With `keep_open` (Enter) a name that cannot be
+    /// used leaves the field open to correct it; a click elsewhere closes it
+    /// either way. True when the field closed.
+    fn commit_rename(&mut self, keep_open: bool) -> bool {
+        let Some(rn) = self.rename.as_ref() else {
+            return true;
+        };
+        self.dirty = true;
+        let from = rn.path.clone();
+        let old = from
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        // Spaces at the ends are nearly always a slip of the finger.
+        let name = rn.ed.text.trim().to_string();
+        if rn.ed.text == old || name == old {
+            self.rename = None;
+            return true;
+        }
+        let to = from.with_file_name(&name);
+        let result = crate::edit::check_name(&name).and_then(|()| {
+            crate::ops::rename_noreplace(&from, &to)
+                .map_err(|e| crate::ops::rename_error(&e, &old, &name))
+        });
+        match result {
+            Ok(()) => {
+                self.rename = None;
+                self.renamed(vec![(from, to)]);
+                true
+            }
+            Err(msg) => {
+                self.flash_error(msg);
+                if !keep_open {
+                    self.rename = None;
+                }
+                !keep_open
+            }
+        }
+    }
+
+    /// Tab in the rename field: apply, then rename the next (Shift: the
+    /// previous) item, to go through a folder name by name.
+    fn rename_next(&mut self, back: bool) {
+        if !self.commit_rename(true) {
+            return;
+        }
+        let t = self.tab();
+        let n = t.shown.len();
+        if n == 0 {
+            return;
+        }
+        let j = if back {
+            (t.cursor + n - 1) % n
+        } else {
+            (t.cursor + 1) % n
+        };
+        self.set_cursor(j, false, false);
+        self.start_rename();
+    }
+
+    /// After items were renamed: an undo step, the list read again and the
+    /// items selected under their new names.
+    fn renamed(&mut self, pairs: Vec<(PathBuf, PathBuf)>) {
+        self.undo.push(crate::ops::Undo::MoveBack(
+            pairs.iter().map(|(f, t)| (t.clone(), f.clone())).collect(),
+        ));
+        let a = self.active;
+        if self.tabs[a].search.is_some() {
+            // Search results are not read again: rename them in place.
+            for (f, t) in &pairs {
+                if let Some(e) = self.tabs[a].all.iter_mut().find(|e| &e.path == f) {
+                    if let Ok(n) = dir::read_one(t, &self.mime) {
+                        *e = n;
+                    }
+                }
+            }
+        }
+        self.load_tab(a, false);
+        self.select_after = pairs.into_iter().map(|(_, t)| t).collect();
+        self.apply_select_after();
+    }
+
+    /// Where a press in the rename field puts the cursor: one press places
+    /// it (Shift extends), two select a word, three the whole name. False
+    /// when the press is outside the field.
+    fn rename_press(&mut self, x: i32, y: i32, shift: bool) -> bool {
+        let Some(i) = self.rename_row() else {
+            return false;
+        };
+        let fr = self.rename_field(i);
+        if !fr.contains(x, y) {
+            return false;
+        }
+        let (font, pad) = (self.m.font, self.m.pad);
+        let Some(rn) = self.rename.as_mut() else {
+            return false;
+        };
+        let x = x - (fr.x + pad / 2 - rn.scroll);
+        let pos = self.text.offset_at(&rn.ed.text, font, x);
+        let n = match rn.clicks {
+            Some((t, n)) if t.elapsed() < DOUBLE_CLICK => n % 3 + 1,
+            _ => 1,
+        };
+        rn.clicks = Some((Instant::now(), n));
+        match n {
+            2 => rn
+                .ed
+                .select_word_at(self.text.char_at(&rn.ed.text, font, x)),
+            3 => rn.ed.select_all(),
+            _ => rn.ed.move_to(pos, shift),
+        }
+        rn.dragging = n == 1;
+        self.dirty = true;
+        true
+    }
+
+    /// The button held after a press in the field: select to the pointer.
+    fn rename_drag(&mut self, x: i32) {
+        let Some(i) = self.rename_row() else {
+            return;
+        };
+        let fr = self.rename_field(i);
+        let (font, pad) = (self.m.font, self.m.pad);
+        let Some(rn) = self.rename.as_mut() else {
+            return;
+        };
+        let pos = self
+            .text
+            .offset_at(&rn.ed.text, font, x - (fr.x + pad / 2 - rn.scroll));
+        if pos != rn.ed.cursor {
+            rn.ed.move_to(pos, true);
+            self.dirty = true;
+        }
+    }
+
+    /// Text from a field onto the clipboard, in place of any files.
+    fn copy_text(&mut self, s: String) {
+        if s.is_empty() {
+            return;
+        }
+        self.clip = None;
+        self.clip_text = Some(s);
+        let _ = self.x.own_clipboard();
+    }
+
+    /// Ctrl+V in a text field: our own clipboard at once (files give their
+    /// names), another program's when its answer comes (see `pasted`).
+    fn paste_text(&mut self) {
+        if !self.x.owns_clipboard() {
+            let _ = self.x.request_clipboard(self.x.atoms.utf8);
+            return;
+        }
+        let s = match (&self.clip, &self.clip_text) {
+            (Some((files, _)), _) => files
+                .iter()
+                .filter_map(|p| p.file_name())
+                .map(|n| n.to_string_lossy().into_owned())
+                .collect::<Vec<_>>()
+                .join(" "),
+            (None, Some(t)) => t.clone(),
+            (None, None) => return,
+        };
+        self.insert_in_field(&s);
+    }
+
+    /// Pasted text into whichever text field is open.
+    fn insert_in_field(&mut self, s: &str) {
+        use crate::edit::one_line;
+        if let Some(rn) = self.rename.as_mut() {
+            rn.ed.insert(&one_line(s, true));
+        } else if let Some(b) = self.batch.as_mut() {
+            let ed = if b.field == 0 {
+                &mut b.find
+            } else {
+                &mut b.replace
+            };
+            ed.insert(&one_line(s, true));
+            b.note = None;
+        } else if let Some((_, ed)) = self.place_rename.as_mut() {
+            ed.insert(&one_line(s, false));
+        }
+        self.dirty = true;
+    }
+
+    fn start_batch(&mut self, paths: Vec<PathBuf>) {
+        let items = paths
+            .iter()
+            .map(|p| {
+                let name = p
+                    .file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_default();
+                (name, p.is_dir())
+            })
+            .collect();
+        self.batch = Some(BatchRename {
+            paths,
+            items,
+            find: crate::edit::LineEdit::default(),
+            replace: crate::edit::LineEdit::default(),
+            field: 0,
+            note: None,
+        });
+        self.dirty = true;
+    }
+
+    /// Each item's new path and what stops it, if anything.
+    fn batch_plan(b: &BatchRename) -> Vec<(PathBuf, PathBuf, Option<String>)> {
+        use std::collections::{HashMap, HashSet};
+        let names = crate::edit::batch_names(&b.items, &b.find.text, &b.replace.text, 1);
+        let targets: Vec<PathBuf> = b
+            .paths
+            .iter()
+            .zip(&names)
+            .map(|(p, n)| p.with_file_name(n.trim()))
+            .collect();
+        let mut count: HashMap<&PathBuf, usize> = HashMap::new();
+        for t in &targets {
+            *count.entry(t).or_default() += 1;
+        }
+        let sources: HashSet<&PathBuf> = b.paths.iter().collect();
+        b.paths
+            .iter()
+            .zip(&targets)
+            .zip(&names)
+            .map(|((from, to), name)| {
+                let problem = if count[to] > 1 {
+                    Some("two items would get this name".to_string())
+                } else if from == to {
+                    None
+                } else if let Err(e) = crate::edit::check_name(name.trim()) {
+                    Some(e)
+                } else if !sources.contains(to)
+                    && std::fs::symlink_metadata(to).is_ok()
+                    && !crate::ops::same_file(from, to)
+                {
+                    Some("that name exists already".to_string())
+                } else {
+                    None
+                };
+                (from.clone(), to.clone(), problem)
+            })
+            .collect()
+    }
+
+    fn batch_key(&mut self, sym: u32, ctrl: bool, shift: bool) {
+        let ch = keysym_char(sym);
+        let Some(b) = self.batch.as_mut() else {
             return;
         };
         self.dirty = true;
-        let Some(e) = self.tab().entry(i).cloned() else {
+        if ch == Some('/') && !ctrl {
+            b.note = Some("A name cannot contain \"/\"".into());
+            return;
+        }
+        let ed = if b.field == 0 {
+            &mut b.find
+        } else {
+            &mut b.replace
+        };
+        match ed.key(sym, ctrl, shift, ch) {
+            EditKey::Commit => self.apply_batch(),
+            EditKey::Cancel => self.batch = None,
+            EditKey::Next(_) => b.field = 1 - b.field,
+            EditKey::Copy => {
+                let s = ed.selected().to_string();
+                self.copy_text(s);
+            }
+            EditKey::Cut => {
+                if let Some(s) = ed.cut() {
+                    self.copy_text(s);
+                }
+            }
+            EditKey::Paste => self.paste_text(),
+            EditKey::Edited => b.note = None,
+            EditKey::Ignored => {}
+        }
+    }
+
+    fn apply_batch(&mut self) {
+        let Some(b) = self.batch.as_mut() else {
             return;
         };
-        let name = name.trim().to_string();
-        if name.is_empty() || name == e.name || name == "." || name == ".." {
+        let plan = Self::batch_plan(b);
+        let bad: Vec<&(PathBuf, PathBuf, Option<String>)> =
+            plan.iter().filter(|x| x.2.is_some()).collect();
+        if let Some((_, to, Some(why))) = bad.first() {
+            let name = to.file_name().unwrap_or_default().to_string_lossy();
+            let more = match bad.len() {
+                1 => String::new(),
+                n => format!(" (and {} more)", n - 1),
+            };
+            b.note = Some(format!("\"{name}\": {why}{more}"));
             return;
         }
-        let target = e.path.with_file_name(&name);
-        if std::fs::symlink_metadata(&target).is_ok() {
-            self.flash_error(format!("\"{name}\" already exists"));
+        let moves: Vec<(PathBuf, PathBuf)> = plan
+            .into_iter()
+            .filter(|(f, t, _)| f != t)
+            .map(|(f, t, _)| (f, t))
+            .collect();
+        if moves.is_empty() {
+            b.note = Some("No name changes: type what to find, or what to put instead".into());
             return;
         }
-        match std::fs::rename(&e.path, &target) {
+        self.batch = None;
+        match crate::ops::rename_all(&moves) {
             Ok(()) => {
-                self.undo.push(crate::ops::Undo::MoveBack(vec![(
-                    target.clone(),
-                    e.path.clone(),
-                )]));
-                let a = self.active;
-                self.load_tab(a, false);
-                self.select_after = vec![target];
-                self.apply_select_after();
+                let n = moves.len();
+                self.renamed(moves);
+                self.error = false;
+                self.flash(format!("Renamed {n} item{}", if n == 1 { "" } else { "s" }));
             }
-            Err(err) => self.flash_error(format!("Could not rename: {err}")),
+            Err((done, msg)) => {
+                if !done.is_empty() {
+                    self.renamed(done);
+                }
+                self.flash_error(msg);
+            }
         }
     }
 
@@ -3569,6 +3972,8 @@ impl App {
                 items.push(("Copy path".into(), Act::CopyPath, "Ctrl+Shift+C"));
                 if sel.len() == 1 {
                     items.push(("Rename".into(), Act::Rename, "F2"));
+                } else {
+                    items.push(("Rename…".into(), Act::Rename, "F2"));
                 }
                 if sel.len() == 1
                     && crate::nextcloud::in_sync_folder(&sel[0])
@@ -3743,54 +4148,228 @@ impl App {
         );
     }
 
-    /// The rename field over an item's label.
-    fn draw_rename(&mut self) {
-        let Some((i, buf)) = self.rename.clone() else {
-            return;
-        };
-        let p = self.p;
+    /// Where the rename field of row `i` goes: over the name. In the icon
+    /// views it widens for a long name, up to three cells.
+    fn rename_field(&mut self, i: usize) -> Rect {
         let (font, pad) = (self.m.font, self.m.pad);
         let r = self.item_rect(i);
         let (_, _, pic) = self.grid();
         let fr = match self.view {
-            View::List => Rect::new(
-                r.x + 2 * pad + self.m.small_icon - pad / 2,
-                r.y + 1,
-                r.w / 2,
-                r.h - 2,
-            ),
+            View::List => {
+                let x = r.x + 2 * pad + self.m.small_icon - pad / 2;
+                let w = (self.list_name_w() - self.m.small_icon - pad).max(r.w / 3);
+                Rect::new(x, r.y + 1, w, r.h - 2)
+            }
             View::Compact => {
                 Rect::new(r.x + pad + pic - pad / 2, r.y + 1, r.w - pic - pad, r.h - 2)
             }
-            _ => Rect::new(
-                r.x - pad,
-                r.y + pad + pic + pad / 4,
-                r.w + 2 * pad,
-                font.height + pad / 2,
-            ),
+            _ => {
+                let tw = match self.rename.as_ref() {
+                    Some(rn) => self.text.width(&rn.ed.text, font),
+                    None => 0,
+                };
+                let w = (tw + 2 * pad).clamp(r.w + 2 * pad, 3 * r.w);
+                Rect::new(
+                    r.x + r.w / 2 - w / 2,
+                    r.y + pad + pic + pad / 4,
+                    w,
+                    font.height + pad / 2,
+                )
+            }
         };
-        let fr = Rect::new(
-            fr.x.max(self.content.x),
-            fr.y,
-            fr.w.min(self.content.x + self.content.w - fr.x.max(self.content.x)),
-            fr.h,
-        );
+        // Inside the folder area: moved in from its right edge, then cut.
+        let c = self.content;
+        let x = fr.x.min(c.x + c.w - fr.w).max(c.x);
+        Rect::new(x, fr.y, fr.w.min(c.x + c.w - x), fr.h)
+    }
+
+    /// The rename field over an item's label.
+    fn draw_rename(&mut self) {
+        if self.rename.is_none() {
+            return;
+        }
+        let Some(i) = self.rename_row() else {
+            // Moved or removed by another program while typing.
+            self.rename = None;
+            self.flash_error("The item was moved or removed meanwhile".into());
+            return;
+        };
+        let p = self.p;
+        let fr = self.rename_field(i);
         self.cv.set_clip(self.content);
         self.cv.fill(fr, p.background);
         self.cv.frame(fr, p.accent);
-        let shown = format!("{buf}▏");
-        let tw = self.text.width(&shown, font);
-        let start = (tw - (fr.w - 2 * pad / 2)).max(0);
-        self.cv.set_clip(fr.inset(1).intersect(&self.content));
+        self.cv.reset_clip();
+        if let Some(mut rn) = self.rename.take() {
+            let clip = fr.inset(1).intersect(&self.content);
+            rn.scroll = self.draw_edit(fr, clip, &rn.ed, rn.scroll, true);
+            self.rename = Some(rn);
+        }
+    }
+
+    /// A text field's text, selection and cursor in `fr`, drawn inside
+    /// `clip` and scrolled sideways so the cursor shows. Returns the scroll
+    /// to keep for the next frame.
+    fn draw_edit(
+        &mut self,
+        fr: Rect,
+        clip: Rect,
+        ed: &crate::edit::LineEdit,
+        scroll: i32,
+        focus: bool,
+    ) -> i32 {
+        let p = self.p;
+        let (font, pad) = (self.m.font, self.m.pad);
+        let inner = (fr.w - pad).max(1);
+        let total = self.text.width(&ed.text, font);
+        let at = |t: &mut Text, i: usize| t.width(&ed.text[..i], font);
+        let cx = at(&mut self.text, ed.cursor);
+        // No empty room after the end of the text while it is scrolled.
+        let mut scroll = scroll.min((total + 2 - inner).max(0));
+        if cx - scroll > inner - 2 {
+            scroll = cx - inner + 2;
+        }
+        scroll = scroll.min(cx).max(0);
+        let (tx, ty) = (fr.x + pad / 2 - scroll, fr.y + (fr.h - font.height) / 2);
+        self.cv.set_clip(clip);
+        if ed.has_selection() {
+            // Tinted with the accent: the item's own selection colour is
+            // too close to the field's background in dark themes.
+            let mark = blend(p.selected, p.accent, 0.35);
+            let (a, b) = ed.selection();
+            let (xa, xb) = (at(&mut self.text, a), at(&mut self.text, b));
+            self.cv
+                .fill(Rect::new(tx + xa, ty, xb - xa, font.height), mark);
+        }
+        self.text
+            .draw(&mut self.cv, tx, ty, &ed.text, font, p.foreground);
+        if focus {
+            let w = (1.5 * self.m.s).round().max(1.0) as i32;
+            self.cv
+                .fill(Rect::new(tx + cx, ty, w, font.height), p.accent);
+        }
+        self.cv.reset_clip();
+        scroll
+    }
+
+    /// The dialog for renaming several items, with the new names ahead.
+    fn draw_batch(&mut self) {
+        let Some(b) = self.batch.take() else {
+            return;
+        };
+        let p = self.p;
+        let (font, small, pad) = (self.m.font, self.m.small, self.m.pad);
+        let plan = Self::batch_plan(&b);
+        let rows = plan.len().min(8) as i32;
+        let w = (self.cv.w * 2 / 3)
+            .clamp((420.0 * self.m.s) as i32, (720.0 * self.m.s) as i32)
+            .min(self.cv.w - 2 * pad);
+        let field_h = font.height + pad;
+        let h = 4 * pad
+            + font.height
+            + 2 * (small.height + pad / 3 + field_h + pad)
+            + (rows + 1) * (small.height + pad / 3)
+            + 2 * small.height
+            + 3 * pad;
+        let r = Rect::new((self.cv.w - w) / 2, ((self.cv.h - h) / 3).max(0), w, h);
+        self.cv
+            .tint(Rect::new(0, 0, self.cv.w, self.cv.h), p.background, 140);
+        let sh = (4.0 * self.m.s) as i32;
+        self.cv
+            .tint(Rect::new(r.x + sh, r.y + sh, r.w, r.h), 0x000000, 120);
+        self.cv.fill(r, p.surface);
+        self.cv.frame(r, p.accent);
+        let mut y = r.y + 2 * pad;
+        crate::logo::word(
+            &mut self.cv,
+            r.x + 2 * pad,
+            y,
+            "RENAME",
+            (2.0 * self.m.s).round().max(2.0) as i32,
+            p.accent,
+            None,
+        );
+        y += font.height + pad;
+        let labels = [
+            "Find (empty: the whole name before the extension)",
+            "Replace with ({n} a number, {name} the old name)",
+        ];
+        for (k, label) in labels.iter().enumerate() {
+            let label = self.text.ellipsize(label, small, r.w - 4 * pad);
+            self.text
+                .draw(&mut self.cv, r.x + 2 * pad, y, &label, small, p.muted);
+            y += small.height + pad / 3;
+            let fr = Rect::new(r.x + 2 * pad, y, r.w - 4 * pad, field_h);
+            self.cv.fill(fr, p.background);
+            self.cv
+                .frame(fr, if k == b.field { p.accent } else { p.border });
+            let ed = if k == 0 { &b.find } else { &b.replace };
+            self.draw_edit(fr, fr.inset(1), ed, 0, k == b.field);
+            y += field_h + pad;
+        }
+        // The first new names, as they will be.
+        let col = (r.w - 4 * pad) / 2;
+        for (from, to, problem) in plan.iter().take(rows as usize) {
+            let old = from.file_name().unwrap_or_default().to_string_lossy();
+            let new = to.file_name().unwrap_or_default().to_string_lossy();
+            let old = self.text.ellipsize(&old, small, col - pad);
+            let new = self.text.ellipsize(&format!("→ {new}"), small, col);
+            let c = if problem.is_some() {
+                p.error
+            } else if from == to {
+                p.muted
+            } else {
+                p.foreground
+            };
+            self.text
+                .draw(&mut self.cv, r.x + 2 * pad, y, &old, small, p.muted);
+            self.text
+                .draw(&mut self.cv, r.x + 2 * pad + col, y, &new, small, c);
+            y += small.height + pad / 3;
+        }
+        let bad = plan.iter().filter(|x| x.2.is_some()).count();
+        let mut more = match plan.len() as i32 - rows {
+            0 => String::new(),
+            n => format!("and {n} more"),
+        };
+        if bad > 0 {
+            more = format!(
+                "{more}{}{bad} with a problem",
+                if more.is_empty() { "" } else { " · " }
+            );
+        }
+        self.text
+            .draw(&mut self.cv, r.x + 2 * pad, y, &more, small, p.muted);
+        y += small.height + pad;
+        let (note, warn) = match &b.note {
+            Some(n) => (n.clone(), true),
+            None => (
+                "Folders keep the whole name; extensions stay as they are".into(),
+                false,
+            ),
+        };
+        let note = self.text.ellipsize(&note, small, r.w - 4 * pad);
         self.text.draw(
             &mut self.cv,
-            fr.x + pad / 2 - start,
-            fr.y + (fr.h - font.height) / 2,
-            &shown,
-            font,
-            p.foreground,
+            r.x + 2 * pad,
+            y,
+            &note,
+            small,
+            if warn { p.warning } else { p.muted },
         );
-        self.cv.reset_clip();
+        y += small.height + pad / 2;
+        self.text.draw(
+            &mut self.cv,
+            r.x + 2 * pad,
+            y,
+            &format!(
+                "Enter rename {} items · Tab other field · Esc cancel",
+                b.paths.len()
+            ),
+            small,
+            p.muted,
+        );
+        self.batch = Some(b);
     }
 }
 
@@ -5091,6 +5670,7 @@ impl App {
             }
             0x63 if ctrl => {
                 self.clip = Some((vec![cur.path.clone()], false));
+                self.clip_text = None;
                 let _ = self.x.own_clipboard();
                 self.flash(format!("Copied {}", cur.label));
             }
@@ -5891,7 +6471,7 @@ impl App {
                     ("Delete", "to the trash"),
                     ("Shift+Delete", "delete for good"),
                     ("Ctrl+Z", "undo"),
-                    ("F2", "rename"),
+                    ("F2", "rename (several: find, replace, {n})"),
                     ("Ctrl+Shift+N", "new folder"),
                     ("Alt+Enter", "properties"),
                     ("right-click", "menu: open with, pack, links"),
