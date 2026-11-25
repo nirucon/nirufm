@@ -1191,10 +1191,11 @@ pub fn rename_error(e: &std::io::Error, old: &str, new: &str) -> String {
 mod tests {
     use super::*;
 
-    /// One trash for all tests of this run, never the user's: tests run
-    /// side by side, so it is the same path for each of them.
+    /// One trash for all tests, never the user's: tests run side by side,
+    /// so it is the same path for each of them (and for each run, so runs
+    /// do not leave one behind each).
     fn private_trash() -> PathBuf {
-        let data = std::env::temp_dir().join(format!("nirufm-ops-data-{}", std::process::id()));
+        let data = std::env::temp_dir().join("nirufm-test-trash");
         std::env::set_var("XDG_DATA_HOME", &data);
         data
     }
