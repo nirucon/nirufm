@@ -280,4 +280,20 @@ k ctrl+z
 sleep 0.5
 [ ! -e "$SB/t/beta/Letter.txt" ] || fail "undo of a new file"
 echo "new items ok"
+
+# Redo: Ctrl+Shift+Z and Ctrl+Y do again what Ctrl+Z took back; a new
+# action in between clears what could be redone.
+k ctrl+shift+z
+sleep 0.5
+[ -f "$SB/t/beta/Letter.txt" ] || fail "redo of a new file"
+k ctrl+y
+sleep 0.5
+[ -f "$SB/t/beta/Memo.txt" ] && [ ! -e "$SB/t/beta/Letter.txt" ] || fail "redo of a name"
+k ctrl+z
+sleep 0.5
+[ -f "$SB/t/beta/Letter.txt" ] || fail "undo after redo"
+k ctrl+alt+n Escape ctrl+y
+sleep 0.5
+[ -f "$SB/t/beta/Letter.txt" ] && [ ! -e "$SB/t/beta/Memo.txt" ] || fail "redo after a new action"
+echo "redo ok"
 echo "PASS"

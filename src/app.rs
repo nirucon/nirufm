@@ -172,6 +172,8 @@ pub struct App {
     /// the answer, the window does not.
     ask: Option<Ask>,
     undo: Vec<crate::ops::Undo>,
+    /// What Ctrl+Z took back, to do again with Ctrl+Shift+Z or Ctrl+Y.
+    redo: Vec<crate::ops::Undo>,
     clip: Option<(Vec<PathBuf>, bool)>,
     menu: Option<Menu>,
     confirm: Option<Confirm>,
@@ -372,6 +374,7 @@ struct Props {
 enum Origin {
     New,
     Undo,
+    Redo,
 }
 
 /// The question for a name that exists, from the worker.
@@ -543,6 +546,7 @@ impl App {
             ask: None,
             pending: 0,
             undo: Vec::new(),
+            redo: Vec::new(),
             clip: None,
             menu: None,
             confirm: None,
@@ -1826,7 +1830,9 @@ impl App {
             0x63 => self.act(Act::CopyPath),       // Ctrl+Shift+C: the paths
             0x78 => self.act(Act::Cut),            // x
             0x76 => self.act(Act::Paste),          // v
+            0x7a if shift => self.redo_last(),     // Ctrl+Shift+Z
             0x7a => self.undo_last(),              // z
+            0x79 => self.redo_last(),              // y
             0x6b => self.act(Act::Connect),        // k
             0x67 => self.open_gallery(None),       // g
             0x66 => {
@@ -2923,6 +2929,15 @@ impl App {
     }
 
     fn submit_as(&mut self, job: crate::ops::Job, origin: Origin) {
+        use crate::ops::Job;
+        let changes_files = !matches!(
+            job,
+            Job::Mount { .. } | Job::Eject { .. } | Job::Connect { .. } | Job::Disconnect { .. }
+        );
+        if origin == Origin::New && changes_files {
+            // Redoing on top of another change could undo the wrong thing.
+            self.redo.clear();
+        }
         if self.running.is_none() {
             self.job_started = Some(Instant::now());
         }
@@ -3078,7 +3093,11 @@ impl App {
                         };
                         self.flash_error(format!("{first}{more}"));
                     } else {
-                        self.flash(summary);
+                        self.flash(match origin {
+                            Origin::New => summary,
+                            Origin::Undo => "Undone".into(),
+                            Origin::Redo => "Redone".into(),
+                        });
                     }
                     let a = self.active;
                     self.load_tab(a, false);
@@ -3468,8 +3487,7 @@ impl App {
     /// A new folder or file: an undo step, then straight into renaming it
     /// with the name before the extension selected.
     fn created_new(&mut self, p: PathBuf) {
-        self.undo
-            .push(crate::ops::Undo::TrashCreated(vec![p.clone()]));
+        self.push_undo(crate::ops::Undo::TrashCreated(vec![p.clone()]));
         let a = self.active;
         self.load_tab(a, false);
         self.select_after = vec![p];
@@ -3477,17 +3495,29 @@ impl App {
         self.start_rename();
     }
 
-    /// An undo step from a finished job.
+    /// The undo step of a new action. What was undone before can no
+    /// longer be redone on top of it.
+    fn push_undo(&mut self, u: crate::ops::Undo) {
+        self.redo.clear();
+        self.push_bounded(u, false);
+    }
+
+    /// Onto the undo (or redo) stack, which keeps the last 50 steps.
+    fn push_bounded(&mut self, u: crate::ops::Undo, redo: bool) {
+        let stack = if redo { &mut self.redo } else { &mut self.undo };
+        stack.push(u);
+        if stack.len() > 50 {
+            stack.remove(0);
+        }
+    }
+
+    /// The step a finished job returned: undoing returns how to redo it,
+    /// redoing how to undo it again.
     fn remember_undo(&mut self, u: crate::ops::Undo, origin: Origin) {
         match origin {
-            Origin::New => {
-                self.undo.push(u);
-                if self.undo.len() > 50 {
-                    self.undo.remove(0);
-                }
-            }
-            // Undoing returns how to do it again: kept for redo later.
-            Origin::Undo => {}
+            Origin::New => self.push_undo(u),
+            Origin::Undo => self.push_bounded(u, true),
+            Origin::Redo => self.push_bounded(u, false),
         }
     }
 
@@ -3499,6 +3529,15 @@ impl App {
             return;
         };
         self.submit_as(crate::ops::Job::Revert { undo }, Origin::Undo);
+    }
+
+    /// Ctrl+Shift+Z, Ctrl+Y: what Ctrl+Z took back, done again.
+    fn redo_last(&mut self) {
+        let Some(undo) = self.redo.pop() else {
+            self.flash("Nothing to redo".into());
+            return;
+        };
+        self.submit_as(crate::ops::Job::Revert { undo }, Origin::Redo);
     }
 
     /// Open a place of the side panel: go there, mount it or connect.
@@ -3743,7 +3782,7 @@ impl App {
     /// After items were renamed: an undo step, the list read again and the
     /// items selected under their new names.
     fn renamed(&mut self, pairs: Vec<(PathBuf, PathBuf)>) {
-        self.undo.push(crate::ops::Undo::MoveBack(
+        self.push_undo(crate::ops::Undo::MoveBack(
             pairs.iter().map(|(f, t)| (t.clone(), f.clone())).collect(),
         ));
         let a = self.active;
@@ -6788,6 +6827,7 @@ impl App {
                     ("Delete", "to the trash"),
                     ("Shift+Delete", "delete for good"),
                     ("Ctrl+Z", "undo"),
+                    ("Ctrl+Shift+Z, Ctrl+Y", "redo"),
                     (
                         "R, K, S, M, A",
                         "name exists: replace, keep both, skip, merge, all",

@@ -1536,4 +1536,41 @@ mod tests {
         assert_eq!(read(&d.join("p/d/d")), "file");
         let _ = fs::remove_dir_all(&d);
     }
+    #[test]
+    fn trash_and_move_undo_and_redo_back_and_forth() {
+        let d = tmp("redo");
+        fs::create_dir_all(d.join("to")).unwrap();
+        fs::write(d.join("a"), "a").unwrap();
+        fs::write(d.join("b"), "b").unwrap();
+        let (_, undo, _) = run(Job::Trash {
+            paths: vec![d.join("a")],
+        });
+        assert!(!d.join("a").exists());
+        let (_, redo, _) = run(Job::Revert {
+            undo: undo.unwrap(),
+        });
+        assert_eq!(read(&d.join("a")), "a");
+        let (_, undo, _) = run(Job::Revert {
+            undo: redo.unwrap(),
+        });
+        assert!(!d.join("a").exists());
+        run(Job::Revert {
+            undo: undo.unwrap(),
+        });
+        assert_eq!(read(&d.join("a")), "a");
+        let (_, undo, _) = run(Job::Move {
+            srcs: vec![d.join("b")],
+            dst: d.join("to"),
+        });
+        let (_, redo, _) = run(Job::Revert {
+            undo: undo.unwrap(),
+        });
+        assert_eq!(read(&d.join("b")), "b");
+        run(Job::Revert {
+            undo: redo.unwrap(),
+        });
+        assert_eq!(read(&d.join("to/b")), "b");
+        assert!(!d.join("b").exists());
+        let _ = fs::remove_dir_all(&d);
+    }
 }

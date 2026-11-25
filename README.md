@@ -38,8 +38,10 @@ Measured on the same machine in the same X server (Debian 13). A folder of
 - **Thumbnails** through the freedesktop cache and the system's thumbnailers,
   shared with every other program.
 - **File operations** on a background thread with progress: copy, move,
-  trash (freedesktop trash, restorable), delete, undo, rename. A copy is
-  written to a partial file first and nothing is overwritten unasked.
+  trash (freedesktop trash, restorable), delete, undo, redo, rename. A copy
+  is written to a partial file first and nothing is overwritten unasked.
+  Ctrl+Z undoes renames, moves, copies, trashing and new items, and
+  Ctrl+Shift+Z (or Ctrl+Y) redoes them until something new is done.
 - **Names that exist** when pasting, moving or dropping: you choose Replace,
   Keep both (the new one gets " (2)"), Skip or, for a folder onto a folder,
   Merge (asking again for names inside), with "apply to all remaining" for
@@ -94,7 +96,8 @@ Press F1 in the window for every key. The most used:
 |---|---|
 | Enter, double-click | open (photos open in the gallery) |
 | Backspace, Alt+Left, Alt+Right | parent, back, forward |
-| Ctrl+C, Ctrl+X, Ctrl+V, Delete, Ctrl+Z | copy, cut, paste, trash, undo |
+| Ctrl+C, Ctrl+X, Ctrl+V, Delete | copy, cut, paste, trash |
+| Ctrl+Z, Ctrl+Shift+Z or Ctrl+Y | undo, redo |
 | F2, Ctrl+Shift+N, Ctrl+Alt+N | rename, new folder, new file |
 | Space, Ctrl+G | preview, gallery |
 | Ctrl+F, Ctrl+L | search, type a path |

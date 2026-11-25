@@ -33,6 +33,7 @@ Keys: Enter open · Backspace up · Alt+Left/Right back/forward
       Ctrl+L type a path (Tab completes) · Ctrl+H hidden files
       Ctrl+1 icons · Ctrl+2 list · Ctrl+A select all · F4 terminal
       Ctrl+Shift+N new folder · Ctrl+Alt+N new file · F5 reload
+      Ctrl+Z undo · Ctrl+Shift+Z redo · type to find
 Mouse: double-click open · middle-click folder or place: new tab
        middle-click a tab: close · back/forward buttons";
 
