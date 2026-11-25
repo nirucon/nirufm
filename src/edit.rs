@@ -356,41 +356,181 @@ pub fn one_line(s: &str, no_slash: bool) -> String {
         .collect()
 }
 
-/// New names for a batch rename. `find` empty replaces the whole name
-/// before the extension; `{n}` in `replace` is a running number counted
-/// from `first` over the items that change, padded to the same width for
-/// all, and `{name}` the old name before the extension. Folders keep their
-/// whole name as the stem.
-pub fn batch_names(
-    items: &[(String, bool)],
-    find: &str,
-    replace: &str,
-    first: usize,
-) -> Vec<String> {
-    let hit =
-        |name: &String, is_dir: bool| find.is_empty() || split_name(name, is_dir).0.contains(find);
-    let hits = items.iter().filter(|(n, d)| hit(n, *d)).count();
+/// How a batch rename changes the letters of the new names (before the
+/// extension).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Case {
+    #[default]
+    Keep,
+    Lower,
+    Upper,
+    Title,
+}
+
+impl Case {
+    pub fn next(self) -> Case {
+        match self {
+            Case::Keep => Case::Lower,
+            Case::Lower => Case::Upper,
+            Case::Upper => Case::Title,
+            Case::Title => Case::Keep,
+        }
+    }
+    pub fn label(self) -> &'static str {
+        match self {
+            Case::Keep => "as typed",
+            Case::Lower => "lower case",
+            Case::Upper => "UPPER CASE",
+            Case::Title => "Title Case",
+        }
+    }
+    fn apply(self, s: &str) -> String {
+        match self {
+            Case::Keep => s.to_string(),
+            Case::Lower => s.to_lowercase(),
+            Case::Upper => s.to_uppercase(),
+            Case::Title => {
+                let mut out = String::with_capacity(s.len());
+                let mut start = true;
+                for c in s.chars() {
+                    if start {
+                        out.extend(c.to_uppercase());
+                    } else {
+                        out.extend(c.to_lowercase());
+                    }
+                    start = c.is_whitespace() || matches!(c, '_' | '-' | '.' | '(' | '[');
+                }
+                out
+            }
+        }
+    }
+}
+
+/// What a batch rename does to each name.
+#[derive(Clone, Debug, Default)]
+pub struct Batch {
+    /// Empty: the whole name before the extension is replaced.
+    pub find: String,
+    /// With `{n}`, `{n:03}`, `{name}`, `{ext}` and `{date}`; with `regex`
+    /// also `$1` for what a group of `find` matched.
+    pub replace: String,
+    pub regex: bool,
+    pub case: Case,
+}
+
+/// One item of a batch rename: its name, whether it is a folder, and its
+/// modification time (for `{date}`).
+pub struct BatchItem {
+    pub name: String,
+    pub is_dir: bool,
+    pub mtime: i64,
+}
+
+/// `{n}`, `{n:03}`, `{name}`, `{ext}` and `{date}` in `pattern`. Unknown
+/// braces stay as they are. `dollar` doubles "$" in what is put in, for a
+/// regex replacement.
+fn tokens(
+    pattern: &str,
+    number: usize,
+    width: usize,
+    item: &BatchItem,
+    stem: &str,
+    ext: &str,
+    dollar: bool,
+) -> String {
+    let mut out = String::with_capacity(pattern.len() + stem.len());
+    let mut rest = pattern;
+    let put = |out: &mut String, s: &str| {
+        if dollar {
+            out.push_str(&s.replace('$', "$$"));
+        } else {
+            out.push_str(s);
+        }
+    };
+    while let Some(open) = rest.find('{') {
+        out.push_str(&rest[..open]);
+        let after = &rest[open + 1..];
+        let Some(close) = after.find('}') else {
+            out.push_str(&rest[open..]);
+            return out;
+        };
+        let tok = &after[..close];
+        match tok {
+            "n" => out.push_str(&format!("{number:0width$}")),
+            "name" => put(&mut out, stem),
+            "ext" => put(&mut out, ext.trim_start_matches('.')),
+            "date" => out.push_str(&crate::dir::human_time(item.mtime)[..10]),
+            _ => match tok.strip_prefix("n:").and_then(|w| w.parse::<usize>().ok()) {
+                Some(w) => out.push_str(&format!("{number:0w$}", w = w.min(12))),
+                None => {
+                    out.push('{');
+                    out.push_str(tok);
+                    out.push('}');
+                }
+            },
+        }
+        rest = &after[close + 1..];
+    }
+    out.push_str(rest);
+    out
+}
+
+/// New names for a batch rename, or why the pattern is wrong (a regex
+/// that does not parse). The number counts from `first` over the items
+/// that change, padded to the same width for all (at least two digits)
+/// unless `{n:WIDTH}` says otherwise. Folders keep their whole name as
+/// the stem, and extensions stay as they are.
+pub fn batch_names(items: &[BatchItem], b: &Batch, first: usize) -> Result<Vec<String>, String> {
+    let re =
+        if b.regex && !b.find.is_empty() {
+            Some(regex_lite::Regex::new(&b.find).map_err(|e| {
+                format!("The pattern does not work: {}", first_line(&e.to_string()))
+            })?)
+        } else {
+            None
+        };
+    let hit = |it: &BatchItem| {
+        let stem = split_name(&it.name, it.is_dir).0;
+        match &re {
+            _ if b.find.is_empty() => true,
+            Some(re) => re.is_match(stem),
+            None => stem.contains(b.find.as_str()),
+        }
+    };
+    let hits = items.iter().filter(|it| hit(it)).count();
     let width = (first + hits.saturating_sub(1)).to_string().len().max(2);
     let mut number = first;
-    items
+    Ok(items
         .iter()
-        .map(|(name, is_dir)| {
-            if !hit(name, *is_dir) {
-                return name.clone();
+        .map(|it| {
+            if !hit(it) {
+                return it.name.clone();
             }
-            let (stem, ext) = split_name(name, *is_dir);
-            let with = replace
-                .replace("{n}", &format!("{number:0width$}"))
-                .replace("{name}", stem);
+            let (stem, ext) = split_name(&it.name, it.is_dir);
+            let with = tokens(&b.replace, number, width, it, stem, ext, re.is_some());
             number += 1;
-            let stem = if find.is_empty() {
-                with
+            let new = if b.find.is_empty() {
+                if b.replace.is_empty() {
+                    stem.to_string()
+                } else {
+                    with
+                }
+            } else if let Some(re) = &re {
+                re.replace_all(stem, with.as_str()).into_owned()
             } else {
-                stem.replace(find, &with)
+                stem.replace(b.find.as_str(), &with)
             };
-            format!("{stem}{ext}")
+            format!("{}{ext}", b.case.apply(&new))
         })
-        .collect()
+        .collect())
+}
+
+fn first_line(s: &str) -> String {
+    s.lines()
+        .map(str::trim)
+        .rfind(|l| !l.is_empty())
+        .unwrap_or("")
+        .to_string()
 }
 
 #[cfg(test)]
@@ -542,38 +682,122 @@ mod tests {
         assert_eq!(one_line("/tmp/x", false), "/tmp/x");
     }
 
+    fn items(v: &[(&str, bool)]) -> Vec<BatchItem> {
+        v.iter()
+            .map(|(n, d)| BatchItem {
+                name: n.to_string(),
+                is_dir: *d,
+                mtime: 0,
+            })
+            .collect()
+    }
+
+    fn names(items: &[BatchItem], find: &str, replace: &str, first: usize) -> Vec<String> {
+        let b = Batch {
+            find: find.into(),
+            replace: replace.into(),
+            ..Batch::default()
+        };
+        batch_names(items, &b, first).unwrap()
+    }
+
     #[test]
     fn batch_names_find_replace_and_number() {
-        let items = vec![
-            ("IMG_001.jpg".to_string(), false),
-            ("IMG_002.JPG".to_string(), false),
-            ("IMG dir".to_string(), true),
-        ];
+        let it = items(&[
+            ("IMG_001.jpg", false),
+            ("IMG_002.JPG", false),
+            ("IMG dir", true),
+        ]);
+        assert_eq!(names(&it, "IMG_", "", 1), ["001.jpg", "002.JPG", "IMG dir"]);
         assert_eq!(
-            batch_names(&items, "IMG_", "", 1),
-            ["001.jpg", "002.JPG", "IMG dir"]
-        );
-        assert_eq!(
-            batch_names(&items, "", "Summer {n}", 1),
+            names(&it, "", "Summer {n}", 1),
             ["Summer 01.jpg", "Summer 02.JPG", "Summer 03"]
         );
         assert_eq!(
-            batch_names(&items, "IMG", "{n}", 9),
+            names(&it, "IMG", "{n}", 9),
             ["09_001.jpg", "10_002.JPG", "11 dir"]
         );
-        assert_eq!(
-            batch_names(&items[..1], "", "{name} copy", 1),
-            ["IMG_001 copy.jpg"]
-        );
+        assert_eq!(names(&it[..1], "", "{name} copy", 1), ["IMG_001 copy.jpg"]);
         // Only the names that change are counted.
-        let items = vec![
-            ("a.txt".to_string(), false),
-            ("IMG_9.jpg".to_string(), false),
-            ("IMG_7.jpg".to_string(), false),
-        ];
+        let it = items(&[("a.txt", false), ("IMG_9.jpg", false), ("IMG_7.jpg", false)]);
         assert_eq!(
-            batch_names(&items, "IMG_", "Trip {n} ", 1),
+            names(&it, "IMG_", "Trip {n} ", 1),
             ["a.txt", "Trip 01 9.jpg", "Trip 02 7.jpg"]
         );
+    }
+
+    #[test]
+    fn batch_pattern_tokens() {
+        let mut it = items(&[
+            ("beach.jpg", false),
+            ("backup.tar.gz", false),
+            ("Dir", true),
+        ]);
+        it[0].mtime = 1_700_000_000;
+        let d = crate::dir::human_time(1_700_000_000)[..10].to_string();
+        assert_eq!(
+            names(&it, "", "Holiday {n:03}", 1),
+            ["Holiday 001.jpg", "Holiday 002.tar.gz", "Holiday 003"]
+        );
+        assert_eq!(
+            names(&it[..2], "", "{name}-{ext}", 1),
+            ["beach-jpg.jpg", "backup-tar.gz.tar.gz"]
+        );
+        assert_eq!(
+            names(&it[..1], "", "{date} {name}", 1),
+            [format!("{d} beach.jpg")]
+        );
+        // Unknown braces stay, and so does a lone one.
+        assert_eq!(names(&it[..1], "", "{x} {n:zz} {", 1), ["{x} {n:zz} {.jpg"]);
+        // Nothing to find and nothing to put: the names stay.
+        assert_eq!(names(&it, "", "", 1), ["beach.jpg", "backup.tar.gz", "Dir"]);
+    }
+
+    #[test]
+    fn batch_regex_and_case() {
+        let it = items(&[
+            ("IMG_2024_07.jpg", false),
+            ("notes.TXT", false),
+            ("my holiday-pics", true),
+        ]);
+        let mut b = Batch {
+            find: r"IMG_(\d+)_(\d+)".into(),
+            replace: "$2-$1 {name}".into(),
+            regex: true,
+            ..Batch::default()
+        };
+        assert_eq!(
+            batch_names(&it, &b, 1).unwrap(),
+            ["07-2024 IMG_2024_07.jpg", "notes.TXT", "my holiday-pics"]
+        );
+        // A "$" in an old name is put in as it is.
+        let it2 = items(&[("IMG_1_2 $1.jpg", false)]);
+        b.replace = "{name}".into();
+        assert_eq!(batch_names(&it2, &b, 1).unwrap(), ["IMG_1_2 $1 $1.jpg"]);
+        b.find = "(".into();
+        assert!(batch_names(&it, &b, 1)
+            .unwrap_err()
+            .starts_with("The pattern does not work"));
+        let mut b = Batch {
+            case: Case::Upper,
+            ..Batch::default()
+        };
+        assert_eq!(
+            batch_names(&it, &b, 1).unwrap(),
+            ["IMG_2024_07.jpg", "NOTES.TXT", "MY HOLIDAY-PICS"]
+        );
+        b.case = Case::Title;
+        assert_eq!(
+            batch_names(&it, &b, 1).unwrap(),
+            ["Img_2024_07.jpg", "Notes.TXT", "My Holiday-Pics"]
+        );
+        b.case = Case::Lower;
+        b.find = "o".into();
+        b.replace = "Ö".into();
+        assert_eq!(
+            batch_names(&it, &b, 1).unwrap(),
+            ["IMG_2024_07.jpg", "nötes.TXT", "my höliday-pics"]
+        );
+        assert_eq!(Case::Title.next(), Case::Keep);
     }
 }

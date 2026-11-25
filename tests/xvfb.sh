@@ -339,4 +339,140 @@ if [ "$(id -u)" != 0 ] && [ "$(stat -c %u /etc/hostname 2>/dev/null)" = 0 ]; the
   k Escape
 fi
 echo "permissions ok"
+# Type to filter: letters keep the names that hold them (case and accents
+# do not matter), Backspace takes one back, Esc shows all, "/" types a path.
+mkdir -p "$SB/f/sub" "$SB/fake"
+for n in Älg.txt alpha.txt beta.txt café.md; do echo "$n" > "$SB/f/$n"; done
+# Stand-ins for the programs "Send to" runs: they write down how they were called.
+for tool in niruprodrive xdg-email; do
+  printf '#!/bin/sh\necho "$@" >> "%s/%s.log"\n' "$SB" "$tool" > "$SB/fake/$tool"
+done
+printf '#!/bin/sh\nif [ "$1" = devices ]; then echo %s; exit 0; fi\necho "$@" >> "%s/nirushare.log"\n' \
+  "'[{\"host\": \"laptop\", \"online\": true}, {\"host\": \"desk\", \"online\": true}]'" "$SB" > "$SB/fake/nirushare"
+chmod +x "$SB/fake/"*
+PATH="$SB/fake:$PATH" NIRUFM_PLACES=1 "$BIN" "$SB/f" 2>"$SB/f.err" &
+F=$!
+PIDS="$PIDS $F"
+sleep 1.2
+WF=$(xdotool search --pid "$F" | head -1)
+xdotool windowmove "$WF" 0 0; xdotool windowfocus --sync "$WF"; sleep 0.3
+fstate() { grep '^state ' "$SB/f.err" | tail -1; }
+shown() { fstate | awk '{print $4}'; }
+xdotool type --delay 60 "alg"; sleep 0.4
+[ "$(shown)" = 1 ] || fail "filter alg: $(fstate)"
+k BackSpace
+[ "$(shown)" = 2 ] || fail "Backspace in the filter: $(fstate)"
+k Escape
+[ "$(shown)" = 5 ] || fail "Esc did not clear the filter: $(fstate)"
+xdotool type --delay 60 "CAFE"; sleep 0.4
+[ "$(shown)" = 1 ] && [ "$(fstate | awk '{print $2}')" = 1 ] || fail "filter CAFE: $(fstate)"
+k Escape slash
+grep '^field Path ' "$SB/f.err" | tail -1 | grep -q 'text /$' || fail "/ does not type a path"
+k Escape BackSpace
+fstate | grep -q "dir $SB\$" || fail "Backspace with no filter: $(fstate)"
+k alt+Left
+fstate | grep -q "dir $SB/f\$" || fail "back: $(fstate)"
+echo "type to filter ok"
+
+# Folder size on demand (Alt+S) and the SHA-256 in Properties, copied.
+want=$(find "$SB/f" -type f -exec stat -c %s {} + | awk '{s += $1} END {print s}')
+k alt+s
+sleep 0.5
+grep '^propssize ' "$SB/f.err" | tail -1 | grep -q "^propssize $want files 4 folders 2 done true stopped false" || fail "folder size: $(grep '^propssize' "$SB/f.err" | tail -1), want $want"
+k Escape
+n1=$(grep -c '^propssize ' "$SB/f.err")
+xdotool type --delay 60 "beta"; sleep 0.3
+k alt+Return
+[ "$(grep -c '^propssize ' "$SB/f.err")" = "$n1" ] || fail "a size was counted without asking"
+k s
+sleep 0.6
+sum=$(sha256sum "$SB/f/beta.txt" | cut -d' ' -f1)
+grep '^propssha ' "$SB/f.err" | tail -1 | grep -q "^propssha $sum\$" || fail "checksum: $(grep '^propssha' "$SB/f.err" | tail -1)"
+k ctrl+c Escape Escape ctrl+l ctrl+v
+grep '^field Path ' "$SB/f.err" | tail -1 | grep -q "text $sum\$" || fail "the checksum was not copied: $(grep '^field Path' "$SB/f.err" | tail -1)"
+k Escape
+echo "folder size and checksum ok"
+
+# Send to: Proton Drive and mail only when their programs are there;
+# NIRUSHARE to one device or all of them.
+xdotool type --delay 60 "alpha"; sleep 0.3
+menu_click() {
+  k Menu
+  set -- $(grep "^menuitem $1 [0-9]* [0-9]*\$" "$SB/f.err" | tail -1 | awk '{print $(NF-1), $NF}')
+  [ -n "${2:-}" ] || fail "no menu entry: $(grep '^menuitem' "$SB/f.err" | tail -3)"
+  xdotool mousemove "$1" "$2" click 1; sleep 0.6
+}
+menu_click "Send to Proton Drive"
+grep -qx "upload $SB/f/alpha.txt" "$SB/niruprodrive.log" || fail "Proton Drive: $(cat "$SB/niruprodrive.log")"
+menu_click "Copy Proton Drive link"
+grep -qx "link $SB/f/alpha.txt" "$SB/niruprodrive.log" || fail "Proton Drive link: $(cat "$SB/niruprodrive.log")"
+menu_click "Send by email"
+grep -qx -- "--attach $SB/f/alpha.txt" "$SB/xdg-email.log" || fail "mail: $(cat "$SB/xdg-email.log")"
+menu_click "Send to all my devices"
+grep -qx -- "send --all --file $SB/f/alpha.txt" "$SB/nirushare.log" || fail "all devices: $(cat "$SB/nirushare.log")"
+menu_click "Send to laptop"
+grep -qx -- "send --to laptop --file $SB/f/alpha.txt" "$SB/nirushare.log" || fail "one device: $(cat "$SB/nirushare.log")"
+k Escape
+echo "send to ok"
+
+# Batch rename: a pattern with a padded number, a regex with a group and
+# a change of case, each one Ctrl+Z; a name that exists is refused.
+mkdir -p "$SB/r"
+for i in 1 2 3; do echo "$i" > "$SB/r/IMG_$i.jpg"; done
+echo t > "$SB/r/Trip 01.jpg"
+k ctrl+l ctrl+a
+xdotool type --delay 30 "$SB/r"
+k Return
+k Home shift+Right shift+Right F2 Tab
+xdotool type --delay 40 "Holiday {n:03}"
+k Return
+[ -f "$SB/r/Holiday 001.jpg" ] && [ -f "$SB/r/Holiday 003.jpg" ] && [ ! -e "$SB/r/IMG_2.jpg" ] || fail "pattern rename: $(ls "$SB/r")"
+k ctrl+z
+[ -f "$SB/r/IMG_1.jpg" ] && [ -f "$SB/r/IMG_3.jpg" ] && [ ! -e "$SB/r/Holiday 001.jpg" ] || fail "undo of a pattern rename: $(ls "$SB/r")"
+k Home shift+Right shift+Right F2 alt+r
+xdotool type --delay 40 'IMG_(\d)'
+k Tab
+xdotool type --delay 40 'Pic-$1'
+k alt+c alt+c Return
+[ -f "$SB/r/PIC-1.jpg" ] && [ -f "$SB/r/PIC-3.jpg" ] || fail "regex and case: $(ls "$SB/r")"
+k ctrl+z
+[ -f "$SB/r/IMG_1.jpg" ] && [ ! -e "$SB/r/PIC-1.jpg" ] || fail "undo of a regex rename: $(ls "$SB/r")"
+k Home shift+Right F2 Tab
+xdotool type --delay 40 "Trip {n}"
+k Return
+grep -q '^batch IMG_1.jpg -> Trip 01.jpg problem$' "$SB/f.err" || fail "the name that exists is not flagged"
+[ -f "$SB/r/IMG_1.jpg" ] && [ "$(cat "$SB/r/Trip 01.jpg")" = t ] || fail "a name that exists was replaced: $(ls "$SB/r")"
+k Escape
+echo "batch rename ok"
+
+# Recent: the files of recently-used.xbel that are still there.
+printf '<?xml version="1.0"?>\n<xbel version="1.0">\n<bookmark href="file://%s/f/beta.txt" modified="2026-01-02T00:00:00Z"/>\n<bookmark href="file://%s/gone.txt" modified="2026-01-03T00:00:00Z"/>\n</xbel>\n' "$SB" "$SB" > "$XDG_DATA_HOME/recently-used.xbel"
+set -- $(grep '^place Recent ' "$SB/f.err" | tail -1)
+xdotool mousemove "$3" "$4" click 1; sleep 0.6
+[ "$(shown)" = 1 ] && grep -q '^item beta.txt ' "$SB/f.err" || fail "Recent: $(fstate)"
+echo "recent ok"
+
+# Compare two panes (Shift+F3): what is only on one side and the newer
+# copy are selected; F6 copies them across.
+mkdir -p "$SB/L" "$SB/R"
+echo same > "$SB/L/a.txt"; cp -p "$SB/L/a.txt" "$SB/R/a.txt"
+echo l > "$SB/L/only-l.txt"; echo r > "$SB/R/only-r.txt"
+echo new > "$SB/L/new.txt"; echo old > "$SB/R/new.txt"; touch -d 2020-01-01 "$SB/R/new.txt"
+k ctrl+l ctrl+a
+xdotool type --delay 30 "$SB/L"
+k Return F3 Tab ctrl+l ctrl+a
+xdotool type --delay 30 "$SB/R"
+k Return shift+F3
+grep '^compare ' "$SB/f.err" | tail -1 | grep -q '^compare 2 2$' || fail "compare: $(grep '^compare' "$SB/f.err" | tail -1)"
+fstate | grep -q "^state 1 selected 3 dir $SB/R\$" || fail "right pane selection: $(fstate)"
+k Tab
+fstate | grep -q "^state 2 selected 3 dir $SB/L\$" || fail "left pane selection: $(fstate)"
+k F6
+sleep 0.6
+k r
+sleep 0.6
+[ "$(cat "$SB/R/new.txt")" = new ] && [ -f "$SB/R/only-l.txt" ] || fail "copy across: $(ls "$SB/R")"
+grep '^compare ' "$SB/f.err" | tail -1 | grep -q '^compare 0 1$' || fail "compare after the copy: $(grep '^compare' "$SB/f.err" | tail -1)"
+k shift+F3
+echo "compare ok"
 echo "PASS"

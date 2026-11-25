@@ -860,6 +860,67 @@ fn set_mtime(p: &Path, sec: i64, nsec: i64) {
     unsafe { libc::utimensat(libc::AT_FDCWD, c.as_ptr(), times.as_ptr(), 0) };
 }
 
+/// What `count` found so far.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Totals {
+    pub bytes: u64,
+    pub files: u64,
+    pub folders: u64,
+    /// The folders that could not be read.
+    pub unreadable: u64,
+    pub done: bool,
+    /// Ended by `stop` before the end.
+    pub stopped: bool,
+}
+
+/// Count the files and bytes in `paths` and everything below them
+/// (links are counted, not followed; other file systems mounted below are
+/// left out), into `totals` as it goes. `stop` ends it early; `wake` is
+/// poked a few times a second and at the end.
+pub fn count(paths: Vec<PathBuf>, totals: &std::sync::Mutex<Totals>, stop: &AtomicBool, wake: i32) {
+    let mut last = std::time::Instant::now();
+    let mut t = Totals::default();
+    let devs: Vec<(PathBuf, u64)> = paths
+        .iter()
+        .filter_map(|p| fs::symlink_metadata(p).ok().map(|m| (p.clone(), m.dev())))
+        .collect();
+    let mut stack: Vec<(PathBuf, u64)> = devs;
+    while let Some((p, dev)) = stack.pop() {
+        if stop.load(Ordering::Relaxed) {
+            t.stopped = true;
+            break;
+        }
+        let Ok(m) = fs::symlink_metadata(&p) else {
+            continue;
+        };
+        if m.is_dir() {
+            t.folders += 1;
+            if m.dev() != dev {
+                continue;
+            }
+            match fs::read_dir(&p) {
+                Ok(rd) => stack.extend(rd.flatten().map(|e| (e.path(), dev))),
+                Err(_) => t.unreadable += 1,
+            }
+        } else {
+            t.bytes += m.len();
+            t.files += 1;
+        }
+        if last.elapsed() > std::time::Duration::from_millis(150) {
+            last = std::time::Instant::now();
+            if let Ok(mut g) = totals.lock() {
+                *g = t;
+            }
+            poke(wake);
+        }
+    }
+    t.done = true;
+    if let Ok(mut g) = totals.lock() {
+        *g = t;
+    }
+    poke(wake);
+}
+
 pub fn tree_size(p: &Path) -> u64 {
     let Ok(m) = fs::symlink_metadata(p) else {
         return 0;
@@ -1378,6 +1439,32 @@ mod tests {
         assert_eq!(fs::read_dir(&d).unwrap().count(), 4);
         let _ = fs::remove_dir_all(&d);
     }
+    #[test]
+    fn count_adds_up_a_tree_and_stops_when_asked() {
+        let d = tmp("count");
+        fs::create_dir_all(d.join("a/b")).unwrap();
+        fs::write(d.join("one"), "12345").unwrap();
+        fs::write(d.join("a/two"), "123").unwrap();
+        fs::write(d.join("a/b/three"), "1").unwrap();
+        std::os::unix::fs::symlink("/", d.join("a/link")).unwrap();
+        let totals = std::sync::Mutex::new(Totals::default());
+        let stop = AtomicBool::new(false);
+        count(vec![d.clone()], &totals, &stop, -1);
+        let t = *totals.lock().unwrap();
+        assert!(t.done && !t.stopped);
+        assert_eq!((t.files, t.folders), (4, 3));
+        assert_eq!(
+            t.bytes,
+            9 + fs::symlink_metadata(d.join("a/link")).unwrap().len()
+        );
+        stop.store(true, Ordering::Relaxed);
+        count(vec![d.clone()], &totals, &stop, -1);
+        let t = *totals.lock().unwrap();
+        assert!(t.done && t.stopped);
+        assert_eq!(t.files, 0);
+        let _ = fs::remove_dir_all(&d);
+    }
+
     #[test]
     fn pasting_where_it_is_keeps_both_without_asking() {
         let d = tmp("same");

@@ -4,10 +4,12 @@ mod apps;
 mod archive;
 mod band;
 mod canvas;
+mod compare;
 mod devices;
 mod dir;
 mod edit;
 mod exif;
+mod filter;
 mod icons;
 mod logo;
 mod mime;
@@ -16,6 +18,8 @@ mod ops;
 mod perms;
 mod places;
 mod remote;
+mod sendto;
+mod sha256;
 mod templates;
 mod text;
 mod theme;
@@ -34,7 +38,9 @@ Keys: Enter open · Backspace up · Alt+Left/Right back/forward
       Ctrl+L type a path (Tab completes) · Ctrl+H hidden files
       Ctrl+1 icons · Ctrl+2 list · Ctrl+A select all · F4 terminal
       Ctrl+Shift+N new folder · Ctrl+Alt+N new file · F5 reload
-      Ctrl+Z undo · Ctrl+Shift+Z redo · type to find
+      Ctrl+Z undo · Ctrl+Shift+Z redo · type to filter (Esc clears)
+      F2 rename (several: pattern, regex, case) · Alt+S folder size
+      F3 two panes · Shift+F3 compare them · F6 copy to the other pane
 Mouse: double-click open · middle-click folder or place: new tab
        middle-click a tab: close · back/forward buttons";
 

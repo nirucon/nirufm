@@ -59,6 +59,8 @@ struct Tab {
     error: Option<String>,
     /// A search below `path` replaces the folder's own items.
     search: Option<String>,
+    /// Typed letters: only names that hold them are shown.
+    filter: String,
 }
 
 impl Tab {
@@ -75,10 +77,22 @@ impl Tab {
             scroll: 0,
             error: None,
             search: None,
+            filter: String::new(),
         }
     }
     fn entry(&self, i: usize) -> Option<&Entry> {
         self.shown.get(i).and_then(|j| self.all.get(*j))
+    }
+    /// The items of `all` that are shown: hidden ones only with `hidden`,
+    /// and with a filter typed only the names that hold it.
+    fn visible(&self, hidden: bool) -> Vec<usize> {
+        let words = crate::filter::words(&self.filter);
+        (0..self.all.len())
+            .filter(|k| {
+                let e = &self.all[*k];
+                (hidden || !e.hidden()) && crate::filter::matches(&e.name, &words)
+            })
+            .collect()
     }
     fn title(&self) -> String {
         self.path
@@ -113,6 +127,18 @@ enum Hit {
     /// A button of the dialog for a name that exists.
     Answer(crate::ops::Choice),
     AnswerAll,
+    /// The regex box (0) and the case button (1) of the batch rename.
+    BatchOpt(u8),
+    /// A button of the properties sheet: count the size, the checksum,
+    /// copy the checksum.
+    PropsButton(PropsButton),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PropsButton {
+    Count,
+    Sha,
+    CopySha,
 }
 
 struct Metrics {
@@ -152,7 +178,8 @@ pub struct App {
     cols: i32,
     hover: Option<usize>,
     last_click: Option<(Instant, usize)>,
-    typed: String,
+    /// When a letter was last typed to filter (a Space soon after is part
+    /// of the filter, not the preview).
     typed_at: Instant,
     /// The path bar while a path is typed (Ctrl+L).
     path_edit: Option<crate::edit::LineEdit>,
@@ -260,6 +287,15 @@ pub struct App {
     nc_tx: std::sync::mpsc::Sender<(PathBuf, u8)>,
     nc_rx: std::sync::mpsc::Receiver<(PathBuf, u8)>,
     props: Option<Props>,
+    /// The two panes compared: the marks of the left and the right one.
+    compare: Option<(
+        std::collections::HashMap<String, crate::compare::Mark>,
+        std::collections::HashMap<String, crate::compare::Mark>,
+    )>,
+    /// What a program run for the menu said when it ended (an error is
+    /// marked true), for the status line.
+    note_tx: std::sync::mpsc::Sender<(String, bool)>,
+    note_rx: std::sync::mpsc::Receiver<(String, bool)>,
     search_due: Option<Instant>,
     search_gen: std::sync::Arc<std::sync::atomic::AtomicUsize>,
     searching: bool,
@@ -326,16 +362,19 @@ struct Rename {
     ed: crate::edit::LineEdit,
 }
 
-/// The dialog for renaming several items: find and replace in the names
-/// before their extensions, with a running number.
+/// The dialog for renaming several items: find (text or a regex) and
+/// replace in the names before their extensions, with a running number,
+/// the old name, its extension and date, and a change of case.
 struct BatchRename {
     paths: Vec<PathBuf>,
-    /// (name, is a folder) of each path.
-    items: Vec<(String, bool)>,
+    /// Name, folder or not, and time of each path.
+    items: Vec<crate::edit::BatchItem>,
     find: crate::edit::LineEdit,
     replace: crate::edit::LineEdit,
     /// 0 find, 1 replace.
     field: usize,
+    regex: bool,
+    case: crate::edit::Case,
     note: Option<String>,
 }
 
@@ -370,17 +409,43 @@ struct Preview {
     ready: bool,
 }
 
-/// The properties sheet: totals are counted on a thread.
+/// The properties sheet. What is in folders is counted, and a file's
+/// checksum computed, only when asked for, on a thread of their own that
+/// stops when asked or when the sheet closes.
 struct Props {
     paths: Vec<PathBuf>,
-    /// bytes, files, folders, done
-    totals: std::sync::Arc<std::sync::Mutex<(u64, u64, u64, bool)>>,
-    sha: std::sync::Arc<std::sync::Mutex<Option<String>>>,
+    /// The count of what is inside, once asked for.
+    totals: Option<std::sync::Arc<std::sync::Mutex<crate::ops::Totals>>>,
+    count_stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    sha: std::sync::Arc<std::sync::Mutex<Sha>>,
+    /// Bytes of the file read for the checksum so far, and in all.
+    sha_done: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    sha_total: u64,
+    sha_stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
     /// The permission box with the keyboard focus: 0..9 the grid (owner,
     /// group, others by read, write, run), 9 "executable".
     focus: usize,
     /// What the last change of permissions did, and whether it failed.
     note: Option<(String, bool)>,
+}
+
+impl Drop for Props {
+    fn drop(&mut self) {
+        // A count or checksum still going is of no use once the sheet is gone.
+        self.count_stop
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        self.sha_stop
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// The checksum in the properties sheet.
+#[derive(Clone, Debug, PartialEq)]
+enum Sha {
+    Idle,
+    Running,
+    Done(String),
+    Failed(String),
 }
 
 /// Why a job was sent, which decides where its undo step goes.
@@ -464,6 +529,17 @@ enum Act {
     OpenWithOther,
     Wallpaper,
     SendTo(u8),
+    /// To every NIRUSHARE device.
+    SendAll,
+    ProtonUpload,
+    ProtonLink,
+    Mail,
+    /// The size of folders, counted in the properties sheet.
+    FolderSize,
+    /// Compare the two panes, or stop comparing.
+    Compare,
+    /// Copy the selection to the folder of the other pane.
+    CopyAcross,
 }
 
 struct Menu {
@@ -507,6 +583,7 @@ impl App {
         let (gallery_tx, gallery_rx) = std::sync::mpsc::channel();
         let (search_tx, search_rx) = std::sync::mpsc::channel();
         let (nc_tx, nc_rx) = std::sync::mpsc::channel();
+        let (note_tx, note_rx) = std::sync::mpsc::channel();
         // A drive plugged in or pulled out shows up in /dev/disk/by-id;
         // a mount or unmount makes /proc/self/mounts readable with POLLPRI.
         let dev_watch = if inotify >= 0 {
@@ -558,7 +635,6 @@ impl App {
             cols: 1,
             hover: None,
             last_click: None,
-            typed: String::new(),
             typed_at: Instant::now(),
             path_edit: None,
             dirty: true,
@@ -637,6 +713,9 @@ impl App {
             nc_tx,
             nc_rx,
             props: None,
+            compare: None,
+            note_tx,
+            note_rx,
             search_due: None,
             search_gen: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             searching: false,
@@ -662,13 +741,12 @@ impl App {
     fn load_tab(&mut self, i: usize, reset: bool) {
         if reset {
             self.tabs[i].search = None;
+            self.tabs[i].filter.clear();
         } else if self.tabs[i].search.is_some() {
             // Search results stay; only the hidden filter is applied again.
             let hidden = self.hidden;
             let t = &mut self.tabs[i];
-            t.shown = (0..t.all.len())
-                .filter(|k| hidden || !t.all[*k].hidden())
-                .collect();
+            t.shown = t.visible(hidden);
             t.selected = vec![false; t.shown.len()];
             t.cursor = t.cursor.min(t.shown.len().saturating_sub(1));
             self.dirty = true;
@@ -678,6 +756,15 @@ impl App {
             .then(|| {
                 self.tabs[i]
                     .entry(self.tabs[i].cursor)
+                    .map(|e| e.name.clone())
+            })
+            .flatten();
+        // The anchor too, so Shift+arrows go on from where they started
+        // when another program changes the folder meanwhile.
+        let keep_anchor = (!reset)
+            .then(|| {
+                self.tabs[i]
+                    .entry(self.tabs[i].anchor)
                     .map(|e| e.name.clone())
             })
             .flatten();
@@ -711,9 +798,7 @@ impl App {
         let t = &mut self.tabs[i];
         t.all = all;
         t.error = error;
-        t.shown = (0..t.all.len())
-            .filter(|k| hidden || !t.all[*k].hidden())
-            .collect();
+        t.shown = t.visible(hidden);
         t.selected = t
             .shown
             .iter()
@@ -722,7 +807,9 @@ impl App {
         t.cursor = keep
             .and_then(|n| t.shown.iter().position(|k| t.all[*k].name == n))
             .unwrap_or(0);
-        t.anchor = t.cursor;
+        t.anchor = keep_anchor
+            .and_then(|n| t.shown.iter().position(|k| t.all[*k].name == n))
+            .unwrap_or(t.cursor);
         if reset {
             t.scroll = 0;
         }
@@ -734,6 +821,9 @@ impl App {
             let _ = self
                 .x
                 .set_title(&format!("{} · NIRUFM", places::pretty(&self.tabs[i].path)));
+        }
+        if self.compare.is_some() {
+            self.recompare(false);
         }
         self.dirty = true;
     }
@@ -880,6 +970,7 @@ impl App {
         }
         self.tabs.remove(i);
         self.split = None;
+        self.end_compare();
         if self.active >= self.tabs.len() || self.active > i {
             self.active = self.active.saturating_sub(1);
         }
@@ -1220,8 +1311,25 @@ impl App {
                             );
                         }
                     }
-                    if let Some((note, _)) = self.props.as_ref().and_then(|p| p.note.as_ref()) {
-                        eprintln!("propsnote {note}");
+                    if let Some(pr) = self.props.as_ref() {
+                        if let Some((note, _)) = pr.note.as_ref() {
+                            eprintln!("propsnote {note}");
+                        }
+                        if let Some(t) = pr.totals.as_ref().and_then(|t| t.lock().ok().map(|g| *g))
+                        {
+                            eprintln!(
+                                "propssize {} files {} folders {} done {} stopped {}",
+                                t.bytes, t.files, t.folders, t.done, t.stopped
+                            );
+                        }
+                        if let Ok(g) = pr.sha.lock() {
+                            if let Sha::Done(h) = &*g {
+                                eprintln!("propssha {h}");
+                            }
+                        }
+                    }
+                    if let Some((l, r)) = &self.compare {
+                        eprintln!("compare {} {}", l.len(), r.len());
                     }
                     if let Some(a) = &self.ask {
                         eprintln!("ask {} all {}", a.name, a.all);
@@ -1492,6 +1600,7 @@ impl App {
         if self.props.is_some() {
             match (b, self.hit(x, y)) {
                 (1, Some(Hit::Perm(k))) => self.props_toggle(k),
+                (1, Some(Hit::PropsButton(k))) => self.props_button(k),
                 (_, Some(Hit::MenuOutside)) => self.props = None,
                 _ => {}
             }
@@ -1516,6 +1625,9 @@ impl App {
             return;
         }
         if self.batch.is_some() {
+            if let (1, Some(Hit::BatchOpt(k))) = (b, self.hit(x, y)) {
+                self.batch_option(k);
+            }
             return;
         }
         if self.rename.is_some() && matches!(b, 1..=3) {
@@ -1716,7 +1828,7 @@ impl App {
             return;
         }
         if self.props.is_some() {
-            return self.props_key(sym, shift);
+            return self.props_key(sym, shift, ctrl);
         }
         if self.connect.is_some() {
             return self.connect_key(sym, ctrl, shift);
@@ -1725,7 +1837,7 @@ impl App {
             return self.chooser_key(sym);
         }
         if self.batch.is_some() {
-            return self.batch_key(sym, ctrl, shift);
+            return self.batch_key(sym, ctrl, shift, alt);
         }
         if self.search_edit.is_some() {
             return self.search_key(sym, ctrl, shift);
@@ -1783,15 +1895,17 @@ impl App {
         // keysyms: X11/keysymdef.h
         match sym {
             0xff1b => {
-                // Escape: cancel a running job, else clear the selection.
-                if self.running.is_some() {
+                // Escape: clear the filter, cancel a running job, else
+                // clear the selection.
+                if !self.tab().filter.is_empty() {
+                    self.set_filter(String::new());
+                } else if self.running.is_some() {
                     // The job running now, the first sent of those left.
                     if let Some((_, cancel)) = self.jobs.front() {
                         cancel.store(true, std::sync::atomic::Ordering::Relaxed);
                     }
                     self.flash("Cancelling…".into());
                 } else {
-                    self.typed.clear();
                     self.clear_selection();
                 }
             }
@@ -1803,8 +1917,11 @@ impl App {
                     self.act(Act::Trash);
                 }
             }
-            0xffbf => self.act(Act::Rename), // F2
-            0xffc0 => self.toggle_split(),   // F3
+            0xffbf => self.act(Act::Rename),           // F2
+            0xffc0 if shift => self.act(Act::Compare), // Shift+F3
+            0xffc0 => self.toggle_split(),             // F3
+            0xffc3 => self.act(Act::CopyAcross),       // F6
+            0x73 | 0x53 if alt && !ctrl => self.act(Act::FolderSize), // Alt+S
             0xffbe => {
                 // F1: the keys
                 self.help = !self.help;
@@ -1816,7 +1933,7 @@ impl App {
                 }
             }
             0x20 if !ctrl
-                && (self.typed.is_empty()
+                && (self.tab().filter.is_empty()
                     || self.typed_at.elapsed() > Duration::from_millis(900)) =>
             {
                 self.toggle_preview()
@@ -1834,6 +1951,12 @@ impl App {
                     return self.open_props();
                 }
                 self.open_selection();
+            }
+            0xff08 if !self.tab().filter.is_empty() => {
+                // BackSpace takes back the last letter of the filter.
+                let mut f = self.tab().filter.clone();
+                f.pop();
+                self.set_filter(f);
             }
             0xff08 => self.up(),             // BackSpace
             0xff52 if alt => self.up(),      // Alt+Up
@@ -1876,8 +1999,12 @@ impl App {
             _ if ctrl => self.ctrl_key(sym, shift),
             _ => {
                 if let Some(c) = keysym_char(sym) {
-                    if !c.is_control() && !alt {
-                        self.type_ahead(c);
+                    if c == '/' && self.tab().filter.is_empty() && !alt {
+                        // No name holds "/": it starts typing a path.
+                        self.path_edit = Some(crate::edit::LineEdit::new("/"));
+                        self.dirty = true;
+                    } else if !c.is_control() && !alt {
+                        self.type_filter(c);
                     }
                 }
             }
@@ -2013,25 +2140,41 @@ impl App {
         }
     }
 
-    fn type_ahead(&mut self, c: char) {
-        if self.typed_at.elapsed() > Duration::from_millis(900) {
-            self.typed.clear();
-        }
+    /// A letter typed in the folder: only the names that hold what was
+    /// typed stay in sight (case and accents do not matter).
+    fn type_filter(&mut self, c: char) {
         self.typed_at = Instant::now();
-        self.typed.extend(c.to_lowercase());
-        let t = self.tab();
-        let want = self.typed.clone();
-        let start = t.cursor;
-        let n = t.shown.len();
-        // From the cursor on (a repeated letter cycles), then from the top.
-        let found = (0..n)
-            .map(|k| (start + if want.chars().count() == 1 { k + 1 } else { k }) % n.max(1))
-            .find(|k| {
-                t.entry(*k)
-                    .is_some_and(|e| e.name.to_lowercase().starts_with(&want))
-            });
-        if let Some(k) = found {
-            self.set_cursor(k, false, false);
+        let mut f = self.tab().filter.clone();
+        f.push(c);
+        self.set_filter(f);
+    }
+
+    /// Show the items of the active tab that match `f`; the first of
+    /// them gets the cursor and the selection, so Enter, F2 or Alt+Enter
+    /// act on it.
+    fn set_filter(&mut self, f: String) {
+        let hidden = self.hidden;
+        let keep = self.tab().entry(self.tab().cursor).map(|e| e.path.clone());
+        let t = self.tab_mut();
+        t.filter = f;
+        t.shown = t.visible(hidden);
+        t.selected = vec![false; t.shown.len()];
+        t.scroll = 0;
+        let typing = !t.filter.is_empty();
+        let at = if typing {
+            0
+        } else {
+            // Cleared: back to the item that was under the cursor.
+            keep.and_then(|p| t.shown.iter().position(|k| t.all[*k].path == p))
+                .unwrap_or(0)
+        };
+        t.cursor = at;
+        t.anchor = at;
+        if !t.shown.is_empty() {
+            if typing {
+                t.selected[at] = true;
+            }
+            self.reveal();
         }
         self.dirty = true;
     }
@@ -2083,6 +2226,7 @@ impl App {
 
     fn toggle_split(&mut self) {
         if self.split.take().is_some() {
+            self.end_compare();
             self.dirty = true;
             return;
         }
@@ -2554,12 +2698,15 @@ impl App {
             return;
         }
         if self.tab().shown.is_empty() {
-            let tag = if self.tab().all.is_empty() {
+            let tag = if !self.tab().filter.is_empty() {
+                "NOTHING MATCHES"
+            } else if self.tab().all.is_empty() {
                 "EMPTY FOLDER"
             } else {
                 "ONLY HIDDEN FILES"
             };
             crate::logo::splash(&mut self.cv, c, &p, tag);
+            self.draw_filter();
             self.cv.reset_clip();
             return;
         }
@@ -2569,7 +2716,36 @@ impl App {
         }
         self.draw_band();
         self.draw_scrollbar();
+        self.draw_filter();
         self.cv.reset_clip();
+    }
+
+    /// What was typed to filter, in a box at the foot of the folder.
+    fn draw_filter(&mut self) {
+        if self.tab().filter.is_empty() {
+            return;
+        }
+        let p = self.p;
+        let (font, pad) = (self.m.font, self.m.pad);
+        let c = self.content;
+        let text = format!("Filter: {}", self.tab().filter);
+        let text = self.text.ellipsize(&text, font, c.w / 2);
+        let w = self.text.width(&text, font) + 2 * pad;
+        let h = font.height + pad;
+        let r = Rect::new(c.x + c.w - w - 2 * pad, c.y + c.h - h - pad, w, h);
+        let sh = (3.0 * self.m.s) as i32;
+        self.cv
+            .tint(Rect::new(r.x + sh, r.y + sh, r.w, r.h), 0x000000, 110);
+        self.cv.fill(r, p.surface);
+        self.cv.frame(r, p.accent);
+        self.text.draw(
+            &mut self.cv,
+            r.x + pad,
+            r.y + (h - font.height) / 2,
+            &text,
+            font,
+            p.foreground,
+        );
     }
 
     fn icon_for(&mut self, e: &Entry, size: i32) -> Option<std::rc::Rc<crate::canvas::Image>> {
@@ -2625,8 +2801,11 @@ impl App {
                     );
                 }
                 let tx = r.x + pad + icon;
-                let name = self.text.ellipsize(&e.label, font, r.w - icon - 2 * pad);
-                self.text.draw(
+                let bw = self.badge_room(&e.name);
+                let name = self
+                    .text
+                    .ellipsize(&e.label, font, r.w - icon - 2 * pad - bw);
+                let tw = self.text.draw(
                     &mut self.cv,
                     tx,
                     r.y + (r.h - font.height) / 2,
@@ -2634,6 +2813,8 @@ impl App {
                     font,
                     col,
                 );
+                let u = (2.0 * self.m.s).max(2.0) as i32;
+                self.draw_compare_badge(&e.name, tx + tw + pad / 2, r.y + (r.h - 6 * u) / 2);
                 self.hits.push((r.intersect(&c), Hit::Item(i)));
                 continue;
             }
@@ -2669,6 +2850,7 @@ impl App {
                 r.x + (r.w + icon) / 2 - 5 * u,
                 r.y + pad + icon - 6 * u,
             );
+            self.draw_compare_badge(&e.name, r.x + (r.w - icon) / 2, r.y + pad);
             let max_lines = if self.view == View::Thumbs { 1 } else { 2 };
             // The rename field stands in for the name; a second line of
             // the old one would show below it.
@@ -2760,8 +2942,11 @@ impl App {
             }
             self.draw_nc_badge(&e.path, c.x + pad + si - 4, r.y + row_h / 2);
             let tx = c.x + pad * 2 + si;
-            let name = self.text.ellipsize(&e.label, font, name_w - si - 2 * pad);
-            self.text.draw(
+            let bw = self.badge_room(&e.name);
+            let name = self
+                .text
+                .ellipsize(&e.label, font, name_w - si - 2 * pad - bw);
+            let tw = self.text.draw(
                 &mut self.cv,
                 tx,
                 r.y + (row_h - font.height) / 2,
@@ -2769,6 +2954,8 @@ impl App {
                 font,
                 if e.hidden() { p.muted } else { p.foreground },
             );
+            let u = (2.0 * self.m.s).max(2.0) as i32;
+            self.draw_compare_badge(&e.name, tx + tw + pad / 2, r.y + (row_h - 6 * u) / 2);
             let ty = r.y + (row_h - small.height) / 2;
             let size = if e.is_dir {
                 String::new()
@@ -2936,8 +3123,33 @@ impl App {
         } else if let Some(m) = msg {
             let col = if self.error { p.error } else { p.accent };
             self.text.draw(&mut self.cv, r.x + pad, ty, &m, small, col);
-        } else if !self.typed.is_empty() && self.typed_at.elapsed() < Duration::from_millis(900) {
-            let s = format!("find: {}", self.typed);
+        } else if let Some((l, r2)) = self.compare.as_ref() {
+            let (_, right_tab) = self.split.unwrap_or((0, 0));
+            let mine = if self.active == right_tab { r2 } else { l };
+            let only = mine
+                .values()
+                .filter(|m| **m == crate::compare::Mark::Only)
+                .count();
+            let newer = mine
+                .values()
+                .filter(|m| **m == crate::compare::Mark::Differs { newer: true })
+                .count();
+            let older = mine.len() - only - newer;
+            let s = format!(
+                "Compare: {only} only here · {newer} newer here · {older} older here · F6 copies the selection across · Shift+F3 stops"
+            );
+            let s = self.text.ellipsize(&s, small, r.w * 3 / 4);
+            self.text
+                .draw(&mut self.cv, r.x + pad, ty, &s, small, p.accent);
+        } else if !self.tab().filter.is_empty() {
+            let t = self.tab();
+            let all = t.all.iter().filter(|e| self.hidden || !e.hidden()).count();
+            let s = format!(
+                "Filter \"{}\": {} of {all} · Backspace takes back · Esc shows all",
+                t.filter,
+                t.shown.len()
+            );
+            let s = self.text.ellipsize(&s, small, r.w * 3 / 4);
             self.text
                 .draw(&mut self.cv, r.x + pad, ty, &s, small, p.accent);
         } else if let Some(e) = self.hover.and_then(|h| self.tab().entry(h).cloned()) {
@@ -3048,6 +3260,14 @@ impl App {
             self.thumb_img.insert(d.path, fitted);
             self.dirty = true;
         }
+        while let Ok((note, err)) = self.note_rx.try_recv() {
+            if err {
+                self.flash_error(note);
+            } else {
+                self.error = false;
+                self.flash(note);
+            }
+        }
         while let Ok((path, st)) = self.nc_rx.try_recv() {
             self.nc_status.insert(path, st);
             self.dirty = true;
@@ -3058,8 +3278,9 @@ impl App {
             }
             let hidden = self.hidden;
             let t = self.tab_mut();
+            let words = crate::filter::words(&t.filter);
             for e in found {
-                if hidden || !e.hidden() {
+                if (hidden || !e.hidden()) && crate::filter::matches(&e.name, &words) {
                     t.shown.push(t.all.len());
                     t.selected.push(false);
                 }
@@ -3173,6 +3394,10 @@ impl App {
                     }
                     let a = self.active;
                     self.load_tab(a, false);
+                    // A copy to the other pane shows there too.
+                    if let Some((other, _)) = self.other_pane() {
+                        self.load_tab(other, false);
+                    }
                     self.apply_select_after();
                 }
             }
@@ -3455,21 +3680,70 @@ impl App {
             }
             Act::SendTo(k) => {
                 if let Some(host) = self.menu_hosts.get(k as usize).cloned() {
-                    for p in sel.iter().filter(|p| p.is_file()) {
-                        spawn(
-                            "nirushare",
-                            &[
-                                std::ffi::OsStr::new("send"),
-                                std::ffi::OsStr::new("--to"),
-                                std::ffi::OsStr::new(&host),
-                                std::ffi::OsStr::new("--file"),
-                                p.as_os_str(),
-                            ],
-                            None,
-                        );
+                    let files: Vec<PathBuf> = sel.iter().filter(|p| p.is_file()).cloned().collect();
+                    for (cmd, args) in
+                        crate::sendto::nirushare(crate::sendto::Share::Host(&host), &files)
+                    {
+                        self.run_for_menu(cmd, args, None);
                     }
                     self.flash(format!("Sending to {host}"));
                 }
+            }
+            Act::SendAll => {
+                let files: Vec<PathBuf> = sel.iter().filter(|p| p.is_file()).cloned().collect();
+                for (cmd, args) in crate::sendto::nirushare(crate::sendto::Share::All, &files) {
+                    self.run_for_menu(cmd, args, None);
+                }
+                self.flash("Sending to all my devices".into());
+            }
+            Act::ProtonUpload => {
+                let (cmd, args) = crate::sendto::proton_upload(&sel);
+                self.run_for_menu(
+                    cmd,
+                    args,
+                    Some("Proton Drive takes it (to My files/NIRUX/Uploads)"),
+                );
+                self.flash("Sending to Proton Drive…".into());
+            }
+            Act::ProtonLink => {
+                if let Some(p) = sel.first() {
+                    let (cmd, args) = crate::sendto::proton_link(p);
+                    self.run_for_menu(cmd, args, Some("Proton Drive makes the link and copies it"));
+                    self.flash("Asking Proton Drive for a link…".into());
+                }
+            }
+            Act::Mail => {
+                let files: Vec<PathBuf> = sel.iter().filter(|p| p.is_file()).cloned().collect();
+                match crate::sendto::mail(
+                    &files,
+                    crate::archive::have("xdg-email"),
+                    crate::archive::have("thunderbird"),
+                ) {
+                    Some((cmd, args)) => {
+                        let args: Vec<&std::ffi::OsStr> =
+                            args.iter().map(|a| a.as_os_str()).collect();
+                        spawn(cmd, &args, None);
+                        self.flash("Opening a new mail".into());
+                    }
+                    None => self.flash_error("No mail program (xdg-email or Thunderbird)".into()),
+                }
+            }
+            Act::FolderSize => self.folder_size(),
+            Act::Compare => self.toggle_compare(),
+            Act::CopyAcross => {
+                let Some((other, _)) = self.other_pane() else {
+                    self.flash_error("Copying across needs two panes: F3".into());
+                    return;
+                };
+                if sel.is_empty() {
+                    return;
+                }
+                let dst = self.tabs[other].path.clone();
+                if dst == here {
+                    self.flash_error("Both panes show the same folder".into());
+                    return;
+                }
+                self.submit(crate::ops::Job::Copy { srcs: sel, dst });
             }
             Act::OpenWithOther => {
                 if let Some(mime) = self.menu_mime.clone() {
@@ -4045,6 +4319,7 @@ impl App {
     }
 
     fn start_batch(&mut self, paths: Vec<PathBuf>) {
+        use std::os::unix::fs::MetadataExt;
         let items = paths
             .iter()
             .map(|p| {
@@ -4052,7 +4327,12 @@ impl App {
                     .file_name()
                     .map(|n| n.to_string_lossy().into_owned())
                     .unwrap_or_default();
-                (name, p.is_dir())
+                let m = std::fs::metadata(p).ok();
+                crate::edit::BatchItem {
+                    name,
+                    is_dir: m.as_ref().is_some_and(|m| m.is_dir()),
+                    mtime: m.as_ref().map_or(0, |m| m.mtime()),
+                }
             })
             .collect();
         self.batch = Some(BatchRename {
@@ -4061,15 +4341,37 @@ impl App {
             find: crate::edit::LineEdit::default(),
             replace: crate::edit::LineEdit::default(),
             field: 0,
+            regex: false,
+            case: crate::edit::Case::Keep,
             note: None,
         });
         self.dirty = true;
     }
 
-    /// Each item's new path and what stops it, if anything.
-    fn batch_plan(b: &BatchRename) -> Vec<(PathBuf, PathBuf, Option<String>)> {
+    /// The regex box (0) or the case button (1) of the batch rename.
+    fn batch_option(&mut self, k: u8) {
+        if let Some(b) = self.batch.as_mut() {
+            if k == 0 {
+                b.regex = !b.regex;
+            } else {
+                b.case = b.case.next();
+            }
+            b.note = None;
+            self.dirty = true;
+        }
+    }
+
+    /// Each item's new path and what stops it, if anything; or why the
+    /// pattern itself does not work.
+    fn batch_plan(b: &BatchRename) -> Result<Vec<(PathBuf, PathBuf, Option<String>)>, String> {
         use std::collections::{HashMap, HashSet};
-        let names = crate::edit::batch_names(&b.items, &b.find.text, &b.replace.text, 1);
+        let spec = crate::edit::Batch {
+            find: b.find.text.clone(),
+            replace: b.replace.text.clone(),
+            regex: b.regex,
+            case: b.case,
+        };
+        let names = crate::edit::batch_names(&b.items, &spec, 1)?;
         let targets: Vec<PathBuf> = b
             .paths
             .iter()
@@ -4081,7 +4383,7 @@ impl App {
             *count.entry(t).or_default() += 1;
         }
         let sources: HashSet<&PathBuf> = b.paths.iter().collect();
-        b.paths
+        Ok(b.paths
             .iter()
             .zip(&targets)
             .zip(&names)
@@ -4102,16 +4404,25 @@ impl App {
                 };
                 (from.clone(), to.clone(), problem)
             })
-            .collect()
+            .collect())
     }
 
-    fn batch_key(&mut self, sym: u32, ctrl: bool, shift: bool) {
+    fn batch_key(&mut self, sym: u32, ctrl: bool, shift: bool, alt: bool) {
         let ch = keysym_char(sym);
+        if alt {
+            // Alt+R regex, Alt+C case.
+            match sym | 0x20 {
+                0x72 => self.batch_option(0),
+                0x63 => self.batch_option(1),
+                _ => {}
+            }
+            return;
+        }
         let Some(b) = self.batch.as_mut() else {
             return;
         };
         self.dirty = true;
-        if ch == Some('/') && !ctrl {
+        if ch == Some('/') && !ctrl && !(b.regex && b.field == 0) {
             b.note = Some("A name cannot contain \"/\"".into());
             return;
         }
@@ -4143,7 +4454,13 @@ impl App {
         let Some(b) = self.batch.as_mut() else {
             return;
         };
-        let plan = Self::batch_plan(b);
+        let plan = match Self::batch_plan(b) {
+            Ok(p) => p,
+            Err(e) => {
+                b.note = Some(e);
+                return;
+            }
+        };
         let bad: Vec<&(PathBuf, PathBuf, Option<String>)> =
             plan.iter().filter(|x| x.2.is_some()).collect();
         if let Some((_, to, Some(why))) = bad.first() {
@@ -4253,12 +4570,41 @@ impl App {
                     .map(|h| h.clone())
                     .unwrap_or_default();
                 self.menu_hosts.truncate(4);
-                if sel.iter().all(|p| p.is_file()) {
+                let files_only = sel.iter().all(|p| p.is_file());
+                if files_only {
                     for (k, h) in self.menu_hosts.iter().enumerate() {
                         items.push((format!("Send to {h}"), Act::SendTo(k as u8), "NIRUSHARE"));
                     }
+                    if self.menu_hosts.len() > 1 {
+                        items.push(("Send to all my devices".into(), Act::SendAll, "NIRUSHARE"));
+                    }
                 }
                 self.refresh_share_hosts();
+                if crate::archive::have("niruprodrive") {
+                    items.push((
+                        "Send to Proton Drive".into(),
+                        Act::ProtonUpload,
+                        "niruprodrive",
+                    ));
+                    if sel.len() == 1 {
+                        items.push((
+                            "Copy Proton Drive link".into(),
+                            Act::ProtonLink,
+                            "niruprodrive",
+                        ));
+                    }
+                }
+                if files_only
+                    && (crate::archive::have("xdg-email") || crate::archive::have("thunderbird"))
+                {
+                    items.push(("Send by email".into(), Act::Mail, "attached"));
+                }
+                if self.split.is_some() {
+                    items.push(("Copy to the other pane".into(), Act::CopyAcross, "F6"));
+                }
+                if sel.iter().any(|p| p.is_dir()) {
+                    items.push(("Folder size".into(), Act::FolderSize, "Alt+S"));
+                }
                 items.push(("Properties".into(), Act::Props, "Alt+Enter"));
             }
         } else {
@@ -4278,6 +4624,19 @@ impl App {
                 items.push(("Empty the trash".into(), Act::EmptyTrash, ""));
             }
             items.push(("Terminal here".into(), Act::Terminal, "F4"));
+            items.push(("Size of this folder".into(), Act::FolderSize, "Alt+S"));
+            if self.split.is_some() {
+                items.push((
+                    if self.compare.is_some() {
+                        "Stop comparing"
+                    } else {
+                        "Compare with the other pane"
+                    }
+                    .into(),
+                    Act::Compare,
+                    "Shift+F3",
+                ));
+            }
             items.push((
                 if self.hidden {
                     "Hide hidden files"
@@ -4523,16 +4882,28 @@ impl App {
         };
         let p = self.p;
         let (font, small, pad) = (self.m.font, self.m.small, self.m.pad);
-        let plan = Self::batch_plan(&b);
+        let (plan, pattern_error) = match Self::batch_plan(&b) {
+            Ok(v) => (v, None),
+            Err(e) => (
+                b.paths
+                    .iter()
+                    .map(|f| (f.clone(), f.clone(), None))
+                    .collect(),
+                Some(e),
+            ),
+        };
         let rows = plan.len().min(8) as i32;
         let w = (self.cv.w * 2 / 3)
-            .clamp((420.0 * self.m.s) as i32, (720.0 * self.m.s) as i32)
+            .clamp((460.0 * self.m.s) as i32, (760.0 * self.m.s) as i32)
             .min(self.cv.w - 2 * pad);
         let field_h = font.height + pad;
+        let line = small.height + pad / 3;
         let h = 4 * pad
             + font.height
-            + 2 * (small.height + pad / 3 + field_h + pad)
-            + (rows + 1) * (small.height + pad / 3)
+            + 2 * (line + field_h + pad)
+            + line
+            + pad
+            + (rows + 1) * line
             + 2 * small.height
             + 3 * pad;
         let r = Rect::new((self.cv.w - w) / 2, ((self.cv.h - h) / 3).max(0), w, h);
@@ -4555,14 +4926,22 @@ impl App {
         );
         y += font.height + pad;
         let labels = [
-            "Find (empty: the whole name before the extension)",
-            "Replace with ({n} a number, {name} the old name)",
+            if b.regex {
+                "Find, a regex (empty: the whole name before the extension)"
+            } else {
+                "Find (empty: the whole name before the extension)"
+            },
+            if b.regex {
+                "Replace with: {n} {n:03} number, {name} {ext} {date}, $1 a group"
+            } else {
+                "Replace with: {n} or {n:03} a number, {name} old name, {ext}, {date}"
+            },
         ];
         for (k, label) in labels.iter().enumerate() {
             let label = self.text.ellipsize(label, small, r.w - 4 * pad);
             self.text
                 .draw(&mut self.cv, r.x + 2 * pad, y, &label, small, p.muted);
-            y += small.height + pad / 3;
+            y += line;
             let fr = Rect::new(r.x + 2 * pad, y, r.w - 4 * pad, field_h);
             self.cv.fill(fr, p.background);
             self.cv
@@ -4571,13 +4950,54 @@ impl App {
             self.draw_edit(FieldId::Batch(k), (fr, fr.inset(1)), ed, k == b.field);
             y += field_h + pad;
         }
+        // The options: a box for regex, a button that steps through the cases.
+        let side = (small.height - 2).max(6);
+        let bx = Rect::new(r.x + 2 * pad, y + (small.height - side) / 2, side, side);
+        self.cv.fill(bx, p.background);
+        self.cv.frame(bx, p.border);
+        if b.regex {
+            self.cv.fill(bx.inset((side / 4).max(2)), p.accent);
+        }
+        let tw = self.text.draw(
+            &mut self.cv,
+            bx.x + side + pad / 2,
+            y,
+            "Regex (Alt+R)",
+            small,
+            p.foreground,
+        );
+        self.hits.push((
+            Rect::new(bx.x - pad / 3, y - pad / 3, side + pad + tw, line + pad / 3),
+            Hit::BatchOpt(0),
+        ));
+        let cx = bx.x + side + pad / 2 + tw + 3 * pad;
+        let case = format!("Case: {} (Alt+C)", b.case.label());
+        let cw = self.text.width(&case, small) + pad;
+        let cr = Rect::new(cx, y - pad / 4, cw, small.height + pad / 2);
+        self.cv.fill(cr, p.background);
+        self.cv.frame(
+            cr,
+            if b.case == crate::edit::Case::Keep {
+                p.border
+            } else {
+                p.accent
+            },
+        );
+        self.text
+            .draw(&mut self.cv, cx + pad / 2, y, &case, small, p.foreground);
+        self.hits.push((cr, Hit::BatchOpt(1)));
+        y += line + pad;
         // The first new names, as they will be.
         let col = (r.w - 4 * pad) / 2;
         for (from, to, problem) in plan.iter().take(rows as usize) {
             let old = from.file_name().unwrap_or_default().to_string_lossy();
             let new = to.file_name().unwrap_or_default().to_string_lossy();
             let old = self.text.ellipsize(&old, small, col - pad);
-            let new = self.text.ellipsize(&format!("→ {new}"), small, col);
+            let new = match problem {
+                Some(why) => format!("→ {new}  ({why})"),
+                None => format!("→ {new}"),
+            };
+            let new = self.text.ellipsize(&new, small, col);
             let c = if problem.is_some() {
                 p.error
             } else if from == to {
@@ -4589,26 +5009,32 @@ impl App {
                 .draw(&mut self.cv, r.x + 2 * pad, y, &old, small, p.muted);
             self.text
                 .draw(&mut self.cv, r.x + 2 * pad + col, y, &new, small, c);
-            y += small.height + pad / 3;
+            y += line;
         }
         let bad = plan.iter().filter(|x| x.2.is_some()).count();
+        let changes = plan.iter().filter(|x| x.0 != x.1).count();
         let mut more = match plan.len() as i32 - rows {
             0 => String::new(),
-            n => format!("and {n} more"),
+            n => format!("and {n} more · "),
         };
+        more.push_str(&format!("{changes} of {} change", plan.len()));
         if bad > 0 {
-            more = format!(
-                "{more}{}{bad} with a problem",
-                if more.is_empty() { "" } else { " · " }
-            );
+            more.push_str(&format!(" · {bad} with a problem"));
         }
-        self.text
-            .draw(&mut self.cv, r.x + 2 * pad, y, &more, small, p.muted);
+        self.text.draw(
+            &mut self.cv,
+            r.x + 2 * pad,
+            y,
+            &more,
+            small,
+            if bad > 0 { p.error } else { p.muted },
+        );
         y += small.height + pad;
-        let (note, warn) = match &b.note {
-            Some(n) => (n.clone(), true),
+        let (note, warn) = match pattern_error.or_else(|| b.note.clone()) {
+            Some(n) => (n, true),
             None => (
-                "Folders keep the whole name; extensions stay as they are".into(),
+                "Folders keep the whole name; extensions stay as they are; one Ctrl+Z undoes all"
+                    .into(),
                 false,
             ),
         };
@@ -4633,6 +5059,16 @@ impl App {
             small,
             p.muted,
         );
+        if std::env::var_os("NIRUFM_PLACES").is_some() {
+            for (from, to, problem) in &plan {
+                eprintln!(
+                    "batch {} -> {} {}",
+                    from.file_name().unwrap_or_default().to_string_lossy(),
+                    to.file_name().unwrap_or_default().to_string_lossy(),
+                    if problem.is_some() { "problem" } else { "ok" }
+                );
+            }
+        }
         self.batch = Some(b);
     }
 }
@@ -6266,12 +6702,9 @@ impl App {
             .search_gen
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
             + 1;
-        let words: Vec<String> = q
-            .to_lowercase()
-            .split_whitespace()
-            .map(str::to_string)
-            .collect();
+        let words = crate::filter::words(&q);
         let t = self.tab_mut();
+        t.filter.clear();
         t.all.clear();
         t.shown.clear();
         t.selected.clear();
@@ -6317,8 +6750,7 @@ impl App {
                     if ft.is_dir() && !ft.is_symlink() {
                         stack.push(p.clone());
                     }
-                    let lower = name.to_lowercase();
-                    if words.iter().all(|w| lower.contains(w)) {
+                    if crate::filter::matches(&name, &words) {
                         if let Ok(mut v) = crate::dir::read_one(&p, &mime) {
                             v.label = p
                                 .strip_prefix(&root)
@@ -6355,45 +6787,67 @@ impl App {
         } else {
             paths
         };
-        let totals = std::sync::Arc::new(std::sync::Mutex::new((0u64, 0u64, 0u64, false)));
-        let (t, list, wake) = (totals.clone(), paths.clone(), self.wake);
-        std::thread::spawn(move || {
-            let mut last = Instant::now();
-            let mut stack: Vec<PathBuf> = list;
-            while let Some(p) = stack.pop() {
-                let Ok(m) = std::fs::symlink_metadata(&p) else {
-                    continue;
-                };
-                if let Ok(mut g) = t.lock() {
-                    if m.is_dir() {
-                        g.2 += 1;
-                    } else {
-                        g.0 += m.len();
-                        g.1 += 1;
-                    }
-                }
-                if m.is_dir() {
-                    if let Ok(rd) = std::fs::read_dir(&p) {
-                        stack.extend(rd.flatten().map(|e| e.path()));
-                    }
-                }
-                if last.elapsed() > Duration::from_millis(150) {
-                    last = Instant::now();
-                    crate::ops::poke(wake);
-                }
-            }
-            if let Ok(mut g) = t.lock() {
-                g.3 = true;
-            }
-            crate::ops::poke(wake);
-        });
+        self.props_for(paths);
+    }
+
+    fn props_for(&mut self, paths: Vec<PathBuf>) {
         self.props = Some(Props {
             paths,
-            totals,
-            sha: std::sync::Arc::new(std::sync::Mutex::new(None)),
+            totals: None,
+            count_stop: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            sha: std::sync::Arc::new(std::sync::Mutex::new(Sha::Idle)),
+            sha_done: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            sha_total: 0,
+            sha_stop: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             focus: 0,
             note: None,
         });
+        self.dirty = true;
+    }
+
+    /// Alt+S: the size of the selected folders (or of the one shown when
+    /// no folder is selected), counted now in the properties sheet.
+    fn folder_size(&mut self) {
+        let t = self.tab();
+        let mut paths: Vec<PathBuf> = t
+            .selected
+            .iter()
+            .enumerate()
+            .filter(|(_, s)| **s)
+            .filter_map(|(i, _)| t.entry(i))
+            .filter(|e| e.is_dir)
+            .map(|e| e.path.clone())
+            .collect();
+        if paths.is_empty() {
+            paths.push(t.path.clone());
+        }
+        self.props_for(paths);
+        self.props_count();
+    }
+
+    /// Count what is in the sheet's folders, or stop a count going on.
+    fn props_count(&mut self) {
+        let wake = self.wake;
+        let Some(pr) = self.props.as_mut() else {
+            return;
+        };
+        if !pr.paths.iter().any(|p| p.is_dir()) {
+            return;
+        }
+        if let Some(t) = &pr.totals {
+            let running = t.lock().map(|g| !g.done).unwrap_or(false);
+            if running {
+                pr.count_stop
+                    .store(true, std::sync::atomic::Ordering::Relaxed);
+                return;
+            }
+        }
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        pr.count_stop = stop.clone();
+        let totals = std::sync::Arc::new(std::sync::Mutex::new(crate::ops::Totals::default()));
+        pr.totals = Some(totals.clone());
+        let list = pr.paths.clone();
+        std::thread::spawn(move || crate::ops::count(list, &totals, &stop, wake));
         self.dirty = true;
     }
 
@@ -6435,8 +6889,15 @@ impl App {
 
     /// Keys of the properties sheet: arrows and Tab move between the
     /// permission boxes, Space flips one, X makes a file executable or not,
-    /// S computes the checksum; Esc, Enter or Q close it.
-    fn props_key(&mut self, sym: u32, shift: bool) {
+    /// C counts what is in folders, S computes the checksum and Ctrl+C
+    /// copies it; Esc, Enter or Q close it.
+    fn props_key(&mut self, sym: u32, shift: bool, ctrl: bool) {
+        if ctrl {
+            if sym | 0x20 == 0x63 {
+                self.props_button(PropsButton::CopySha);
+            }
+            return;
+        }
         self.dirty = true;
         let boxes: usize = match self.props_mode() {
             Some((_, _, false)) => 10,
@@ -6461,37 +6922,82 @@ impl App {
             0x20 if boxes > 0 => self.props_toggle(f),
             0x78 | 0x58 if boxes == 10 => self.props_toggle(9),
             0x73 | 0x53 => self.props_checksum(),
+            0x63 | 0x43 => self.props_count(),
             0xff1b | 0xff0d | 0xff8d | 0x71 | 0x51 => self.props = None,
             _ => {}
         }
     }
 
+    /// Compute the SHA-256 of the sheet's file, or stop it.
     fn props_checksum(&mut self) {
-        let Some(pr) = self.props.as_ref() else {
+        let wake = self.wake;
+        let Some(pr) = self.props.as_mut() else {
             return;
         };
         if pr.paths.len() != 1 || pr.paths[0].is_dir() {
             return;
         }
-        let (path, sha, wake) = (pr.paths[0].clone(), pr.sha.clone(), self.wake);
-        if let Ok(mut g) = sha.lock() {
-            *g = Some("computing…".into());
-        }
-        std::thread::spawn(move || {
-            let out = std::process::Command::new("sha256sum").arg(&path).output();
-            let v = match out {
-                Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout)
-                    .split_whitespace()
-                    .next()
-                    .unwrap_or("")
-                    .to_string(),
-                _ => "sha256sum failed".into(),
-            };
-            if let Ok(mut g) = sha.lock() {
-                *g = Some(v);
+        let state = pr.sha.lock().map(|g| g.clone()).unwrap_or(Sha::Idle);
+        if state == Sha::Running {
+            // Stopped: the thread ends without a word.
+            pr.sha_stop
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+            if let Ok(mut g) = pr.sha.lock() {
+                *g = Sha::Idle;
             }
+            self.dirty = true;
+            return;
+        }
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        pr.sha_stop = stop.clone();
+        pr.sha_done = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+        pr.sha_total = std::fs::metadata(&pr.paths[0]).map_or(0, |m| m.len());
+        if let Ok(mut g) = pr.sha.lock() {
+            *g = Sha::Running;
+        }
+        let (path, sha, done) = (pr.paths[0].clone(), pr.sha.clone(), pr.sha_done.clone());
+        std::thread::spawn(move || {
+            // Progress for the sheet while it reads.
+            let tick_stop = stop.clone();
+            let ticker = std::thread::spawn(move || {
+                while !tick_stop.load(std::sync::atomic::Ordering::Relaxed) {
+                    std::thread::sleep(Duration::from_millis(200));
+                    crate::ops::poke(wake);
+                }
+            });
+            let v = match crate::sha256::file(&path, &done, &stop) {
+                Ok(Some(h)) => Some(Sha::Done(h)),
+                Ok(None) => None,
+                Err(e) => Some(Sha::Failed(format!("could not read it: {e}"))),
+            };
+            if let (Some(v), Ok(mut g)) = (v, sha.lock()) {
+                *g = v;
+            }
+            stop.store(true, std::sync::atomic::Ordering::Relaxed);
+            let _ = ticker.join();
             crate::ops::poke(wake);
         });
+        self.dirty = true;
+    }
+
+    fn props_button(&mut self, b: PropsButton) {
+        match b {
+            PropsButton::Count => self.props_count(),
+            PropsButton::Sha => self.props_checksum(),
+            PropsButton::CopySha => {
+                let sum = self
+                    .props
+                    .as_ref()
+                    .and_then(|pr| pr.sha.lock().ok().map(|g| g.clone()));
+                if let Some(Sha::Done(h)) = sum {
+                    self.copy_text(h);
+                    if let Some(pr) = self.props.as_mut() {
+                        pr.note = Some(("Checksum copied".into(), false));
+                    }
+                }
+            }
+        }
+        self.dirty = true;
     }
 
     fn draw_props(&mut self) {
@@ -6501,8 +7007,35 @@ impl App {
         let p = self.p;
         let (font, small, pad) = (self.m.font, self.m.small, self.m.pad);
         let paths = pr.paths.clone();
-        let (bytes, files, dirs, done) = pr.totals.lock().map(|g| *g).unwrap_or_default();
-        let sha = pr.sha.lock().ok().and_then(|g| g.clone());
+        let totals = pr.totals.as_ref().and_then(|t| t.lock().ok().map(|g| *g));
+        let sha = pr.sha.lock().map(|g| g.clone()).unwrap_or(Sha::Idle);
+        let sha_pct = (pr.sha_done.load(std::sync::atomic::Ordering::Relaxed) * 100)
+            .checked_div(pr.sha_total)
+            .unwrap_or(0)
+            .min(100);
+        // What is inside folders, in words: counted, counting or not yet.
+        let inside = |t: Option<crate::ops::Totals>, folders_more: u64| -> String {
+            let Some(t) = t else {
+                return "not counted · C counts".into();
+            };
+            let mut v = format!(
+                "{} in {} files, {} folders",
+                dir::human_size(t.bytes),
+                t.files,
+                t.folders.saturating_sub(folders_more)
+            );
+            if t.unreadable > 0 {
+                v.push_str(&format!(", {} not readable", t.unreadable));
+            }
+            if t.stopped {
+                v.push_str(" (stopped · C again)");
+            } else if !t.done {
+                v.push_str(" so far… · C stops");
+            }
+            v
+        };
+        let mut buttons: Vec<(PropsButton, &'static str)> = Vec::new();
+        let counting = totals.is_some_and(|t| !t.done);
         let mut rows: Vec<(String, String)> = Vec::new();
         let title;
         if paths.len() == 1 {
@@ -6534,13 +7067,17 @@ impl App {
                 ));
             }
             let size = if is_dir {
-                format!(
-                    "{} in {files} files, {} folders{}",
-                    dir::human_size(bytes),
-                    dirs.saturating_sub(1),
-                    if done { "" } else { " (counting…)" }
-                )
+                buttons.push((
+                    PropsButton::Count,
+                    if counting {
+                        "Stop counting"
+                    } else {
+                        "Count size"
+                    },
+                ));
+                inside(totals, 1)
             } else {
+                let bytes = m.as_ref().map_or(0, |m| m.len());
                 format!("{} ({bytes} bytes)", dir::human_size(bytes))
             };
             rows.push(("Size".into(), size));
@@ -6568,21 +7105,54 @@ impl App {
                 ));
             }
             if !is_dir {
-                rows.push((
-                    "SHA-256".into(),
-                    sha.unwrap_or_else(|| "press S to compute".into()),
+                let v = match &sha {
+                    Sha::Idle => "not computed · S computes".to_string(),
+                    Sha::Running => format!("computing… {sha_pct}% · S stops"),
+                    Sha::Done(h) => h.clone(),
+                    Sha::Failed(e) => e.clone(),
+                };
+                buttons.push((
+                    PropsButton::Sha,
+                    if sha == Sha::Running {
+                        "Stop checksum"
+                    } else {
+                        "SHA-256"
+                    },
                 ));
+                if matches!(sha, Sha::Done(_)) {
+                    buttons.push((PropsButton::CopySha, "Copy checksum"));
+                }
+                rows.push(("SHA-256".into(), v));
             }
         } else {
             title = format!("{} items", paths.len());
-            rows.push((
-                "Size".into(),
-                format!(
-                    "{} in {files} files, {dirs} folders{}",
-                    dir::human_size(bytes),
-                    if done { "" } else { " (counting…)" }
-                ),
-            ));
+            let folders = paths.iter().filter(|p| p.is_dir()).count();
+            let size = if folders == 0 || totals.is_some() {
+                match totals {
+                    Some(_) => inside(totals, 0),
+                    None => {
+                        let bytes: u64 = paths
+                            .iter()
+                            .filter_map(|p| std::fs::symlink_metadata(p).ok())
+                            .map(|m| m.len())
+                            .sum();
+                        format!("{} in {} files", dir::human_size(bytes), paths.len())
+                    }
+                }
+            } else {
+                format!("{folders} folders not counted · C counts")
+            };
+            if folders > 0 {
+                buttons.push((
+                    PropsButton::Count,
+                    if counting {
+                        "Stop counting"
+                    } else {
+                        "Count size"
+                    },
+                ));
+            }
+            rows.push(("Size".into(), size));
         }
         let label_w = rows
             .iter()
@@ -6607,10 +7177,16 @@ impl App {
             Some(_) => 6,
             None => 0,
         };
+        let button_h = small.height + pad;
         let h = 4 * pad
             + font.height
             + (rows.len() + perm_rows) as i32 * row_h
             + if perm_rows > 0 { pad } else { 0 }
+            + if buttons.is_empty() {
+                0
+            } else {
+                button_h + pad
+            }
             + small.height
             + 2 * pad;
         let r = Rect::new(
@@ -6656,10 +7232,31 @@ impl App {
         if let Some((_, mode, is_dir)) = perms {
             y = self.draw_perm_boxes(r, label_w, y + pad / 2, mode, is_dir);
         }
+        if !buttons.is_empty() {
+            let mut bx = r.x + 2 * pad;
+            y += pad / 2;
+            for (b, label) in &buttons {
+                let bw = self.text.width(label, small) + 2 * pad;
+                let br = Rect::new(bx, y, bw, button_h);
+                self.cv.fill(br, p.background);
+                self.cv.frame(br, p.accent);
+                self.text.draw(
+                    &mut self.cv,
+                    bx + pad,
+                    y + (button_h - small.height) / 2,
+                    label,
+                    small,
+                    p.foreground,
+                );
+                self.hits.push((br, Hit::PropsButton(*b)));
+                bx += bw + pad;
+            }
+            y += button_h + pad / 2;
+        }
         let keys = if perm_rows > 0 {
-            "Space flip · arrows move · S checksum · Esc close"
+            "Space flip · arrows move · C count · S checksum · Ctrl+C copy · Esc close"
         } else {
-            "S checksum · Esc close"
+            "C count · S checksum · Ctrl+C copy · Esc close"
         };
         self.text.draw(
             &mut self.cv,
@@ -7213,6 +7810,153 @@ fn side_text(s: &crate::ops::Side) -> String {
 }
 
 impl App {
+    /// Run a program for a menu entry on a thread; when it ends, `ok` (or
+    /// what went wrong, from its error output) shows in the status line.
+    fn run_for_menu(
+        &self,
+        cmd: &'static str,
+        args: Vec<std::ffi::OsString>,
+        ok: Option<&'static str>,
+    ) {
+        let (tx, wake) = (self.note_tx.clone(), self.wake);
+        std::thread::spawn(move || {
+            let out = std::process::Command::new(cmd)
+                .args(&args)
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::piped())
+                .output();
+            let note = match out {
+                Ok(o) if o.status.success() => ok.map(|m| (m.to_string(), false)),
+                Ok(o) => {
+                    let err = String::from_utf8_lossy(&o.stderr);
+                    let line = err
+                        .lines()
+                        .rfind(|l| !l.trim().is_empty())
+                        .unwrap_or("failed");
+                    Some((line.trim().to_string(), true))
+                }
+                Err(e) => Some((format!("{cmd}: {e}"), true)),
+            };
+            if let Some(n) = note {
+                let _ = tx.send(n);
+                crate::ops::poke(wake);
+            }
+        });
+    }
+
+    /// Shift+F3: mark what is only in one pane or differs, and select it
+    /// (the newer side of what differs), ready for F6; again to stop.
+    fn toggle_compare(&mut self) {
+        if self.compare.is_some() {
+            self.end_compare();
+            for t in self.tabs.iter_mut() {
+                t.selected.iter_mut().for_each(|s| *s = false);
+            }
+            self.flash("Comparing stopped".into());
+            return;
+        }
+        if self.split.is_none() {
+            self.toggle_split();
+        }
+        self.compare = Some(Default::default());
+        self.recompare(true);
+        let (l, r) = self
+            .compare
+            .as_ref()
+            .map_or((0, 0), |c| (c.0.len(), c.1.len()));
+        self.flash(if l + r == 0 {
+            "The two folders hold the same".into()
+        } else {
+            format!("{l} on the left and {r} on the right differ or are only there")
+        });
+    }
+
+    fn end_compare(&mut self) {
+        if self.compare.take().is_some() {
+            self.dirty = true;
+        }
+    }
+
+    /// Compare the panes again (after a reload); with `select`, select in
+    /// each pane what should be copied to the other.
+    fn recompare(&mut self, select: bool) {
+        let Some((l, r)) = self.split else {
+            self.compare = None;
+            return;
+        };
+        fn items(t: &Tab) -> Vec<crate::compare::Item<'_>> {
+            t.all
+                .iter()
+                .map(|e| crate::compare::Item {
+                    name: &e.name,
+                    is_dir: e.is_dir,
+                    size: e.size,
+                    mtime: e.mtime,
+                })
+                .collect()
+        }
+        let marks = crate::compare::compare(&items(&self.tabs[l]), &items(&self.tabs[r]));
+        if select {
+            for (k, m) in [(l, &marks.0), (r, &marks.1)] {
+                let t = &mut self.tabs[k];
+                for (i, idx) in t.shown.iter().enumerate() {
+                    t.selected[i] = m
+                        .get(&t.all[*idx].name)
+                        .is_some_and(|m| crate::compare::wanted(*m));
+                }
+            }
+        }
+        self.compare = Some(marks);
+        self.dirty = true;
+    }
+
+    /// How an item of the pane being drawn stands against the other pane.
+    fn compare_mark(&self, name: &str) -> Option<crate::compare::Mark> {
+        let (l, _) = self.split?;
+        let (ml, mr) = self.compare.as_ref()?;
+        if self.active == l { ml } else { mr }.get(name).copied()
+    }
+
+    /// The width a compare badge after a name takes, if it has one.
+    fn badge_room(&self, name: &str) -> i32 {
+        if self.compare.is_none() || self.compare_mark(name).is_none() {
+            return 0;
+        }
+        5 * (2.0 * self.m.s).max(2.0) as i32 + self.m.pad
+    }
+
+    /// The compare badge: "+" only here, an arrow up when this copy is
+    /// newer, a bar when it is older.
+    fn draw_compare_badge(&mut self, name: &str, x: i32, y: i32) {
+        let Some(m) = self.compare_mark(name) else {
+            return;
+        };
+        let u = (2.0 * self.m.s).max(2.0) as i32;
+        let (col, glyph): (u32, &[u8]) = match m {
+            crate::compare::Mark::Only => (self.p.accent, &[0b000, 0b010, 0b111, 0b010, 0b000]),
+            crate::compare::Mark::Differs { newer: true } => {
+                (self.p.warning, &[0b010, 0b111, 0b010, 0b010, 0b010])
+            }
+            crate::compare::Mark::Differs { newer: false } => {
+                (self.p.muted, &[0b000, 0b000, 0b111, 0b000, 0b000])
+            }
+        };
+        let r = Rect::new(x, y, 5 * u, 6 * u);
+        self.cv.fill(r, self.p.background);
+        self.cv.frame(r, col);
+        for (row, bits) in glyph.iter().enumerate() {
+            for c in 0..3 {
+                if bits & (4 >> c) != 0 {
+                    self.cv.fill(
+                        Rect::new(x + u + c * u, y + u / 2 + row as i32 * u, u, u),
+                        col,
+                    );
+                }
+            }
+        }
+    }
+
     /// Online NIRUSHARE devices, asked for in the background.
     fn refresh_share_hosts(&self) {
         if !crate::archive::have("nirushare") {
@@ -7312,7 +8056,7 @@ impl App {
                     ("Alt+Left/Right", "back, forward"),
                     ("Ctrl+L", "type a path"),
                     ("Ctrl+F", "search below"),
-                    ("letters", "jump to a name"),
+                    ("letters", "filter the names (Esc: all)"),
                     ("Ctrl+H", "hidden files"),
                     ("Ctrl+1-4", "icons, thumbnails, compact, list"),
                     ("Ctrl+wheel, Ctrl +/-", "zoom"),
@@ -7333,12 +8077,13 @@ impl App {
                         "R, K, S, M, A",
                         "name exists: replace, keep both, skip, merge, all",
                     ),
-                    ("F2", "rename (several: find, replace, {n})"),
+                    ("F2", "rename (several: pattern, regex, case)"),
                     ("Ctrl+Shift+N", "new folder"),
                     ("Ctrl+Alt+N", "new empty file (templates: menu)"),
-                    ("Alt+Enter", "properties, permissions"),
+                    ("Alt+Enter, Alt+S", "properties, folder size"),
                     ("Space, X (properties)", "flip a permission, executable"),
-                    ("right-click", "menu: open with, pack, links"),
+                    ("C, S, Ctrl+C (properties)", "count size, SHA-256, copy it"),
+                    ("right-click", "menu: open with, pack, send to"),
                     ("Open with…, Space", "choose a program, always use it"),
                     ("drag on blank space", "select (Ctrl adds, Shift flips)"),
                     ("drag files", "move (Ctrl copies, Shift moves)"),
@@ -7352,6 +8097,8 @@ impl App {
                     ("Ctrl+Tab", "next tab"),
                     ("F3", "two panes"),
                     ("Tab", "other pane"),
+                    ("Shift+F3", "compare the panes"),
+                    ("F6", "copy to the other pane"),
                     ("F4", "terminal here"),
                     ("F5", "reload"),
                     ("Ctrl+D", "bookmark"),
@@ -7465,6 +8212,7 @@ impl App {
         let t = self.tab_mut();
         t.path = home;
         t.search = Some(RECENT.into());
+        t.filter.clear();
         t.all = entries;
         t.shown = (0..t.all.len()).collect();
         t.selected = vec![false; t.all.len()];

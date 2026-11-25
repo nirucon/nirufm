@@ -52,10 +52,21 @@ Measured on the same machine in the same X server (Debian 13). A folder of
   Ctrl+Right, Shift to select, a click places the cursor, a double-click
   takes a word, Ctrl+C, Ctrl+X, Ctrl+V and Ctrl+Z) and Tab goes on to the
   next name. A name that exists, is empty or has "/" in it is refused and
-  the field stays open; nothing is ever replaced and Ctrl+Z undoes it. F2 on
-  several items finds and replaces in their names, with `{n}` for a running
-  number and a preview of the new names. The path bar (Ctrl+L), search
-  (Ctrl+F) and the Connect form are the same kind of field.
+  the field stays open; nothing is ever replaced and Ctrl+Z undoes it. The
+  path bar (Ctrl+L), search (Ctrl+F) and the Connect form are the same kind
+  of field.
+- **Batch rename** with F2 on several items: a pattern such as
+  `Holiday {n:03}` for the whole name, or find and replace in the names
+  (Alt+R makes the find a regex, with `$1` for its groups). `{n}` is a
+  running number (`{n:03}` with three digits), `{name}` the old name,
+  `{ext}` its extension and `{date}` its date. Alt+C changes the case:
+  lower, UPPER or Title. A preview shows every old and new name and marks
+  the ones that clash with a name that exists or with each other; nothing
+  is replaced, and one Ctrl+Z puts all the names back.
+- **Type to filter:** typing in a folder keeps only the names that hold
+  what you typed, whatever the case or accents ("cafe" finds "Café").
+  Backspace takes a letter back, Esc shows everything again, and `/`
+  starts typing a path. Enter, F2 and the other keys work on what is left.
 - **New items** from the menu on blank space: a folder (Ctrl+Shift+N), an
   empty file (Ctrl+Alt+N) or a copy of any file in `~/Templates` (or the
   folder `XDG_TEMPLATES_DIR` names in `user-dirs.dirs`). The new item opens
@@ -69,8 +80,19 @@ Measured on the same machine in the same X server (Debian 13). A folder of
   name, over the files (in the list view it takes whole rows). Ctrl adds to
   the selection, Shift flips what the band covers, Esc puts it back; the
   folder scrolls on when the band reaches its edge.
-- **Tabs and two panes** (F3), **search** below a folder (Ctrl+F), a
-  **properties** sheet with folder totals and SHA-256 (Alt+Enter).
+- **Tabs and two panes** (F3), **search** below a folder (Ctrl+F) and a
+  **properties** sheet (Alt+Enter).
+- **Compare two panes** with Shift+F3: items only on one side and files
+  that differ in size or time get a mark ("+" only here, an arrow on the
+  newer copy), and what the other side lacks is selected, ready for F6,
+  which copies the selection to the other pane (asking for names that
+  exist).
+- **Folder size on demand:** Alt+S (or "Folder size" in the menu, or
+  "Count size" in Properties) counts a folder on a thread of its own,
+  showing the total as it grows; C or the button stops it, and closing the
+  sheet does too. Nothing is counted unless you ask.
+- **SHA-256** of a file in Properties: S or the button computes it in the
+  background with its progress, and Ctrl+C or "Copy checksum" copies it.
 - **Permissions** in the properties sheet: boxes for who may read, write
   and run (for a folder: open) the item, applied at once, and X to make a
   file executable in one go. When a change is not possible it says why in
@@ -88,8 +110,14 @@ Measured on the same machine in the same X server (Debian 13). A folder of
 - **Open with** any program for the file type: the menu lists the first
   six, and "Open with…" all of them, with "Always open … files with it" to
   make the choice the default (written to `~/.config/mimeapps.list`, the
-  rest of that file kept). Also recent files, send to a
-  NIRUSHARE device, a sound when a long copy ends, and the key sheet on F1.
+  rest of that file kept).
+- **Recent** in the side panel: the files and folders other programs
+  opened lately (`recently-used.xbel`), read only when you open it.
+- **Send to** in the menu: a NIRUSHARE device or all of them, Proton Drive
+  (when `niruprodrive` is installed: send the files or copy a public link)
+  and a new mail with the files attached (`xdg-email`, or Thunderbird).
+  Each entry shows only when its program is there.
+- Also a sound when a long copy ends, and the key sheet on F1.
 
 ## Using it
 
@@ -105,10 +133,13 @@ Press F1 in the window for every key. The most used:
 | Backspace, Alt+Left, Alt+Right | parent, back, forward |
 | Ctrl+C, Ctrl+X, Ctrl+V, Delete | copy, cut, paste, trash |
 | Ctrl+Z, Ctrl+Shift+Z or Ctrl+Y | undo, redo |
-| F2, Ctrl+Shift+N, Ctrl+Alt+N | rename, new folder, new file |
+| F2, Ctrl+Shift+N, Ctrl+Alt+N | rename (several: batch rename), new folder, new file |
+| letters, Esc | filter the names, show all again |
 | Space, Ctrl+G | preview, gallery |
 | Ctrl+F, Ctrl+L | search, type a path |
+| Alt+Enter, Alt+S | properties, folder size |
 | Ctrl+T, F3 | new tab, two panes |
+| Shift+F3, F6 | compare the panes, copy to the other pane |
 | Ctrl+1 to Ctrl+4, Ctrl+wheel | views, zoom |
 
 ## Building

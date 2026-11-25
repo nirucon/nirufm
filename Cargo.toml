@@ -1,6 +1,6 @@
 [package]
 name = "nirufm"
-version = "0.6.1"
+version = "0.7.0"
 edition = "2021"
 rust-version = "1.82"
 license = "MIT"
@@ -14,6 +14,7 @@ png = "0.17"
 toml = "0.8"
 libc = "0.2"
 niruicons = { git = "https://github.com/nirucon/niruicons", tag = "v0.1.0" }
+regex-lite = "0.1"
 
 [profile.release]
 lto = true

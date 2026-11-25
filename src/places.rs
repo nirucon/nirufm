@@ -245,19 +245,32 @@ pub fn pretty(p: &Path) -> String {
     }
 }
 
-/// Recently used files (`recently-used.xbel`), newest first, existing only.
+/// Recently used files and folders (`recently-used.xbel`, which every
+/// GTK program writes), newest first, existing only. Read when Recent is
+/// opened, never before.
 pub fn recent_files(limit: usize) -> Vec<PathBuf> {
     let file = std::env::var_os("XDG_DATA_HOME")
         .map(PathBuf::from)
         .unwrap_or_else(|| crate::theme::home().join(".local/share"))
         .join("recently-used.xbel");
     let text = std::fs::read_to_string(file).unwrap_or_default();
+    parse_recent(&text)
+        .into_iter()
+        .filter(|p| p.exists())
+        .take(limit)
+        .collect()
+}
+
+/// The local paths in an xbel file, newest first, each once.
+fn parse_recent(text: &str) -> Vec<PathBuf> {
     let mut items: Vec<(String, PathBuf)> = Vec::new();
     for chunk in text.split("<bookmark ").skip(1) {
+        // Only the attributes of the bookmark element itself.
+        let head = chunk.split('>').next().unwrap_or("");
         let attr = |name: &str| {
-            chunk
-                .split(&format!("{name}=\""))
+            head.split(&format!(" {name}=\""))
                 .nth(1)
+                .or_else(|| head.strip_prefix(&format!("{name}=\"")))
                 .and_then(|r| r.split('"').next())
                 .map(str::to_string)
         };
@@ -266,15 +279,25 @@ pub fn recent_files(limit: usize) -> Vec<PathBuf> {
             continue;
         };
         if let Some(rest) = href.strip_prefix("file://") {
-            let p = crate::ops::decode_path(&rest.replace("&amp;", "&"));
-            if p.is_file() {
-                items.push((when, p));
-            }
+            items.push((when, crate::ops::decode_path(&xml_unescape(rest))));
         }
     }
+    // The times are ISO 8601 in UTC, so they sort as text.
     items.sort_by(|a, b| b.0.cmp(&a.0));
-    items.dedup_by(|a, b| a.1 == b.1);
-    items.into_iter().take(limit).map(|(_, p)| p).collect()
+    let mut seen = std::collections::HashSet::new();
+    items
+        .into_iter()
+        .filter(|(_, p)| seen.insert(p.clone()))
+        .map(|(_, p)| p)
+        .collect()
+}
+
+fn xml_unescape(s: &str) -> String {
+    s.replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&quot;", "\"")
+        .replace("&apos;", "'")
+        .replace("&amp;", "&")
 }
 
 #[cfg(test)]
@@ -285,5 +308,28 @@ mod tests {
     fn mount_points_with_spaces_are_unescaped() {
         assert_eq!(unescape("/media/niru/My\\040Stick"), "/media/niru/My Stick");
         assert_eq!(unescape("/mnt/plain"), "/mnt/plain");
+    }
+
+    #[test]
+    fn recent_files_newest_first_once_each() {
+        let xbel = r#"<?xml version="1.0" encoding="UTF-8"?>
+<xbel version="1.0">
+  <bookmark href="file:///home/u/old.txt" added="2026-01-01T10:00:00Z" modified="2026-01-01T10:00:00Z" visited="2026-01-01T10:00:00Z">
+    <info><metadata><mime:mime-type type="text/plain"/></metadata></info>
+  </bookmark>
+  <bookmark href="file:///home/u/Tom%20%26%20Jerry.png" added="x" modified="2026-03-01T10:00:00Z" visited="x"/>
+  <bookmark href="file:///home/u/R&amp;D" modified="2026-02-01T10:00:00Z"/>
+  <bookmark href="https://example.com/x" modified="2026-04-01T10:00:00Z"/>
+  <bookmark href="file:///home/u/old.txt" modified="2025-01-01T10:00:00Z"/>
+</xbel>"#;
+        let v = parse_recent(xbel);
+        assert_eq!(
+            v,
+            [
+                PathBuf::from("/home/u/Tom & Jerry.png"),
+                PathBuf::from("/home/u/R&D"),
+                PathBuf::from("/home/u/old.txt"),
+            ]
+        );
     }
 }
