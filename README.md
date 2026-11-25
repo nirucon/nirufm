@@ -48,7 +48,8 @@ Measured on the same machine in the same X server (Debian 13). A folder of
   next name. A name that exists, is empty or has "/" in it is refused and
   the field stays open; nothing is ever replaced and Ctrl+Z undoes it. F2 on
   several items finds and replaces in their names, with `{n}` for a running
-  number and a preview of the new names.
+  number and a preview of the new names. The path bar (Ctrl+L), search
+  (Ctrl+F) and the Connect form are the same kind of field.
 - **Clipboard** shared with other file managers, and **drag and drop** in and
   out (XDND), onto folders, places, tabs and the other pane. A label beside
   the pointer says how many files and whether they move or copy, a folder

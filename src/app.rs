@@ -146,7 +146,8 @@ pub struct App {
     last_click: Option<(Instant, usize)>,
     typed: String,
     typed_at: Instant,
-    path_edit: Option<String>,
+    /// The path bar while a path is typed (Ctrl+L).
+    path_edit: Option<crate::edit::LineEdit>,
     dirty: bool,
     quit: bool,
     inotify: i32,
@@ -217,7 +218,16 @@ pub struct App {
     /// Remembered view per folder: view, zoom, sort, reverse.
     folders: std::collections::HashMap<PathBuf, (View, usize, SortKey, bool)>,
     gallery: Option<Gallery>,
-    search_edit: Option<String>,
+    search_edit: Option<crate::edit::LineEdit>,
+    /// The text fields drawn in the last frame: which, where (the visible
+    /// part), the x where their text starts, for presses in them, and how
+    /// far the text is scrolled, kept so it does not jump between frames.
+    fields: Vec<(FieldId, Rect, i32, i32)>,
+    fields_prev: Vec<(FieldId, Rect, i32, i32)>,
+    /// The last press in a text field and how many came in quick succession.
+    field_clicks: Option<(Instant, u8, FieldId)>,
+    /// The button is held after a press in this field: drag to select.
+    field_drag: Option<FieldId>,
     /// Two panes side by side: the tabs shown left and right.
     split: Option<(usize, usize)>,
     share_hosts: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
@@ -292,12 +302,6 @@ struct Rename {
     /// program writing in the folder) can move it in the list.
     path: PathBuf,
     ed: crate::edit::LineEdit,
-    /// Pixels the text is scrolled left to keep the cursor in the field.
-    scroll: i32,
-    /// The button is held after a press in the field: drag to select.
-    dragging: bool,
-    /// The last press in the field and how many came in quick succession.
-    clicks: Option<(Instant, u8)>,
 }
 
 /// The dialog for renaming several items: find and replace in the names
@@ -313,10 +317,23 @@ struct BatchRename {
     note: Option<String>,
 }
 
+/// A text field the mouse can work in, by what it edits.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum FieldId {
+    Rename,
+    Bookmark,
+    Path,
+    Search,
+    /// 0 address, 1 user, 2 password.
+    Connect(usize),
+    /// 0 find, 1 replace.
+    Batch(usize),
+}
+
 struct ConnectForm {
-    uri: String,
-    user: String,
-    pass: String,
+    uri: crate::edit::LineEdit,
+    user: crate::edit::LineEdit,
+    pass: crate::edit::LineEdit,
     /// 0 address, 1 user, 2 password.
     field: usize,
     login: bool,
@@ -536,6 +553,10 @@ impl App {
             folders: load_folders(),
             gallery: None,
             search_edit: None,
+            fields: Vec::new(),
+            fields_prev: Vec::new(),
+            field_clicks: None,
+            field_drag: None,
             split: None,
             share_hosts: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
             menu_hosts: Vec::new(),
@@ -1030,7 +1051,11 @@ impl App {
             }
             if self.search_due.is_some_and(|t| Instant::now() >= t) {
                 self.search_due = None;
-                let q = self.search_edit.clone().unwrap_or_default();
+                let q = self
+                    .search_edit
+                    .as_ref()
+                    .map(|e| e.text.clone())
+                    .unwrap_or_default();
                 self.start_search(q);
             }
             if let Some(g) = &self.gallery {
@@ -1085,6 +1110,16 @@ impl App {
                                 }
                             }
                             _ => {}
+                        }
+                    }
+                    let fields: Vec<(FieldId, Rect)> =
+                        self.fields.iter().map(|f| (f.0, f.1)).collect();
+                    for (id, r) in fields {
+                        if let Some(ed) = self.field_edit(id) {
+                            eprintln!(
+                                "field {id:?} {} {} {} {} cursor {} anchor {} text {}",
+                                r.x, r.y, r.w, r.h, ed.cursor, ed.anchor, ed.text
+                            );
                         }
                     }
                     let t = self.tab();
@@ -1237,15 +1272,11 @@ impl App {
             Event::MotionNotify(e) if self.place_press.is_some() => {
                 self.place_motion(e.event_x as i32, e.event_y as i32)
             }
-            Event::ButtonRelease(e)
-                if e.detail == 1 && self.rename.as_ref().is_some_and(|r| r.dragging) =>
-            {
-                if let Some(r) = self.rename.as_mut() {
-                    r.dragging = false;
-                }
+            Event::ButtonRelease(e) if e.detail == 1 && self.field_drag.is_some() => {
+                self.field_drag = None
             }
-            Event::MotionNotify(e) if self.rename.as_ref().is_some_and(|r| r.dragging) => {
-                self.rename_drag(e.event_x as i32)
+            Event::MotionNotify(e) if self.field_drag.is_some() => {
+                self.field_drag_to(e.event_x as i32)
             }
             Event::ButtonRelease(e) if e.detail == 1 && self.band.is_some() => self.band_release(),
             Event::MotionNotify(e) if self.band.is_some() => {
@@ -1329,6 +1360,15 @@ impl App {
             self.dirty = true;
             return;
         }
+        if b == 1 && self.menu.is_none() {
+            if let Some(id) = self.field_at(x, y) {
+                return self.field_press(id, x, shift);
+            }
+        }
+        if self.connect.is_some() {
+            // The form is modal: only its fields take presses.
+            return;
+        }
         if self.menu.is_some() {
             if let (1 | 3, Some(Hit::MenuItem(i))) = (b, self.hit(x, y)) {
                 let act = self
@@ -1350,9 +1390,6 @@ impl App {
             return;
         }
         if self.rename.is_some() && matches!(b, 1..=3) {
-            if b == 1 && self.rename_press(x, y, shift) {
-                return;
-            }
             // A click elsewhere applies the name, as in other file managers.
             self.commit_rename(false);
         }
@@ -1561,7 +1598,7 @@ impl App {
             return self.batch_key(sym, ctrl, shift);
         }
         if self.search_edit.is_some() {
-            return self.search_key(sym, ctrl);
+            return self.search_key(sym, ctrl, shift);
         }
         if self.confirm.is_some() {
             match sym {
@@ -1604,7 +1641,7 @@ impl App {
             return self.preview_key(sym);
         }
         if self.path_edit.is_some() {
-            return self.path_key(sym, ctrl);
+            return self.path_key(sym, ctrl, shift);
         }
         let t = self.tab();
         let (cur, n) = (t.cursor, t.shown.len());
@@ -1736,7 +1773,8 @@ impl App {
             0x66 => {
                 // f: search below this folder
                 let q = self.tab().search.clone().unwrap_or_default();
-                self.search_edit = Some(q);
+                let q = if q == RECENT { String::new() } else { q };
+                self.search_edit = Some(crate::edit::LineEdit::selecting(&q, 0, q.len()));
                 self.dirty = true;
             }
             0x64 => self.act(Act::Bookmark), // d
@@ -1754,7 +1792,9 @@ impl App {
             0x61 => self.select_all(), // a
             0x6c => {
                 // l
-                self.path_edit = Some(places::pretty(&self.tab().path));
+                // All selected: typing replaces it, End or a click edits it.
+                let path = places::pretty(&self.tab().path);
+                self.path_edit = Some(crate::edit::LineEdit::selecting(&path, 0, path.len()));
                 self.dirty = true;
             }
             0x72 => {
@@ -1797,63 +1837,23 @@ impl App {
         }
     }
 
-    fn path_key(&mut self, sym: u32, ctrl: bool) {
-        let Some(buf) = self.path_edit.as_mut() else {
+    fn path_key(&mut self, sym: u32, ctrl: bool, shift: bool) {
+        let ch = keysym_char(sym);
+        let Some(ed) = self.path_edit.as_mut() else {
             return;
         };
-        match sym {
-            0xff1b => self.path_edit = None,
-            0xff08 => {
-                if ctrl {
-                    // Remove the last component.
-                    let trimmed = buf.trim_end_matches('/');
-                    let cut = trimmed.rfind('/').map(|i| i + 1).unwrap_or(0);
-                    buf.truncate(cut);
-                } else {
-                    buf.pop();
-                }
-            }
-            0xff09 => {
+        self.dirty = true;
+        match ed.key(sym, ctrl, shift, ch) {
+            EditKey::Cancel => self.path_edit = None,
+            EditKey::Next(false) => {
                 // Tab: complete a folder name.
-                let expanded = expand(buf);
-                let (dir, prefix) = match expanded.rfind('/') {
-                    Some(i) => (expanded[..=i].to_string(), expanded[i + 1..].to_string()),
-                    None => ("./".into(), expanded.clone()),
-                };
-                if let Ok(rd) = std::fs::read_dir(&dir) {
-                    let mut names: Vec<String> = rd
-                        .flatten()
-                        .filter(|e| e.path().is_dir())
-                        .map(|e| e.file_name().to_string_lossy().into_owned())
-                        .filter(|n| {
-                            n.starts_with(&prefix)
-                                && (self.hidden || !n.starts_with('.') || prefix.starts_with('.'))
-                        })
-                        .collect();
-                    names.sort_by(|a, b| dir::natural(a, b));
-                    if let Some(first) = names.first() {
-                        let common = names.iter().fold(first.clone(), |acc, n| {
-                            acc.chars()
-                                .zip(n.chars())
-                                .take_while(|(a, b)| a == b)
-                                .map(|(a, _)| a)
-                                .collect()
-                        });
-                        let done = if names.len() == 1 {
-                            format!("{common}/")
-                        } else {
-                            common
-                        };
-                        let base = buf
-                            .rfind('/')
-                            .map(|i| buf[..=i].to_string())
-                            .unwrap_or_default();
-                        *buf = format!("{base}{done}");
-                    }
+                if let Some(done) = complete_folder(&ed.text, self.hidden) {
+                    ed.select_all();
+                    ed.insert(&done);
                 }
             }
-            0xff0d | 0xff8d => {
-                let target = PathBuf::from(expand(buf));
+            EditKey::Commit => {
+                let target = PathBuf::from(expand(&ed.text));
                 self.path_edit = None;
                 if target.is_dir() {
                     self.go(target);
@@ -1863,15 +1863,18 @@ impl App {
                     self.flash(format!("No such folder: {}", target.display()));
                 }
             }
-            _ => {
-                if let Some(c) = keysym_char(sym) {
-                    if !c.is_control() {
-                        buf.push(c);
-                    }
+            EditKey::Copy => {
+                let s = ed.selected().to_string();
+                self.copy_text(s);
+            }
+            EditKey::Cut => {
+                if let Some(s) = ed.cut() {
+                    self.copy_text(s);
                 }
             }
+            EditKey::Paste => self.paste_text(),
+            EditKey::Next(true) | EditKey::Edited | EditKey::Ignored => {}
         }
-        self.dirty = true;
     }
 
     fn type_ahead(&mut self, c: char) {
@@ -1972,6 +1975,7 @@ impl App {
 
     fn draw(&mut self) {
         self.hits.clear();
+        self.fields_prev = std::mem::take(&mut self.fields);
         self.layout_only();
         self.clamp_scroll();
         let p = self.p;
@@ -2116,7 +2120,7 @@ impl App {
                     Rect::new(field.x, field.y + field.h - 1, field.w, 1),
                     p.accent,
                 );
-                self.draw_edit(field, field, &ed, 0, true);
+                self.draw_edit(FieldId::Bookmark, (field, field), &ed, true);
                 self.place_rename = Some((i, ed));
                 y += row;
                 self.hits.push((r, Hit::Place(i)));
@@ -2225,59 +2229,46 @@ impl App {
             x += bw;
         }
         x += pad;
+        let editing = self.search_edit.is_some();
         let search_shown = self
             .search_edit
-            .clone()
+            .as_ref()
+            .map(|e| e.text.clone())
             .or_else(|| self.tab().search.clone());
         if let Some(q) = search_shown {
             let r = Rect::new(x, pad / 2, bar.x + bar.w - x - pad, bar_h - pad);
             self.cv.fill(r, p.surface);
-            self.cv.frame(
-                r,
-                if self.search_edit.is_some() {
-                    p.accent
-                } else {
-                    p.border
-                },
-            );
-            let label = if q == RECENT {
+            self.cv.frame(r, if editing { p.accent } else { p.border });
+            let recent = q == RECENT && !editing;
+            let label = if recent {
                 "Recently used files".to_string()
             } else {
-                format!("Search {}: ", places::pretty(&self.tab().path))
+                // A long path gives way, the field keeps at least half.
+                let room = r.w / 2 - self.text.width("Search : ", font);
+                let at = places::pretty(&self.tab().path);
+                format!("Search {}: ", self.text.ellipsize(&at, font, room.max(0)))
             };
-            let q = if q == RECENT { String::new() } else { q };
             let lw = self
                 .text
                 .draw(&mut self.cv, r.x + pad, ty, &label, font, p.muted);
-            let caret = if self.search_edit.is_some() {
-                "▏"
-            } else {
-                ""
-            };
-            let shown = self
-                .text
-                .ellipsize(&format!("{q}{caret}"), font, r.w - lw - 2 * pad);
-            self.text
-                .draw(&mut self.cv, r.x + pad + lw, ty, &shown, font, p.foreground);
+            let fr = Rect::new(r.x + pad + lw - pad / 2, r.y, r.w - lw - pad, r.h);
+            if let Some(ed) = self.search_edit.take() {
+                self.draw_edit(FieldId::Search, (fr, fr.intersect(&r.inset(1))), &ed, true);
+                self.search_edit = Some(ed);
+            } else if !recent {
+                let shown = self.text.ellipsize(&q, font, fr.w - pad);
+                self.text
+                    .draw(&mut self.cv, fr.x + pad / 2, ty, &shown, font, p.foreground);
+            }
             return;
         }
-        if let Some(buf) = self.path_edit.clone() {
+        if let Some(ed) = self.path_edit.take() {
             let r = Rect::new(x, pad / 2, bar.x + bar.w - x - pad, bar_h - pad);
             self.cv.fill(r, p.surface);
             self.cv.frame(r, p.accent);
-            let shown = format!("{buf}▏");
-            let tw = self.text.width(&shown, font);
-            let start = (tw - (r.w - 2 * pad)).max(0);
-            self.cv.set_clip(r.inset(1));
-            self.text.draw(
-                &mut self.cv,
-                r.x + pad - start,
-                ty,
-                &shown,
-                font,
-                p.foreground,
-            );
-            self.cv.reset_clip();
+            let fr = Rect::new(r.x + pad / 2, r.y, r.w - pad, r.h);
+            self.draw_edit(FieldId::Path, (fr, r.inset(1)), &ed, true);
+            self.path_edit = Some(ed);
             return;
         }
         // Breadcrumbs: ~ / Documents / Work. The last one is current.
@@ -3571,9 +3562,6 @@ impl App {
         self.rename = Some(Rename {
             path: e.path,
             ed: crate::edit::LineEdit::selecting(&e.name, 0, end),
-            scroll: 0,
-            dragging: false,
-            clicks: None,
         });
         self.dirty = true;
     }
@@ -3698,56 +3686,108 @@ impl App {
         self.apply_select_after();
     }
 
-    /// Where a press in the rename field puts the cursor: one press places
-    /// it (Shift extends), two select a word, three the whole name. False
-    /// when the press is outside the field.
-    fn rename_press(&mut self, x: i32, y: i32, shift: bool) -> bool {
-        let Some(i) = self.rename_row() else {
-            return false;
-        };
-        let fr = self.rename_field(i);
-        if !fr.contains(x, y) {
-            return false;
-        }
-        let (font, pad) = (self.m.font, self.m.pad);
-        let Some(rn) = self.rename.as_mut() else {
-            return false;
-        };
-        let x = x - (fr.x + pad / 2 - rn.scroll);
-        let pos = self.text.offset_at(&rn.ed.text, font, x);
-        let n = match rn.clicks {
-            Some((t, n)) if t.elapsed() < DOUBLE_CLICK => n % 3 + 1,
-            _ => 1,
-        };
-        rn.clicks = Some((Instant::now(), n));
-        match n {
-            2 => rn
-                .ed
-                .select_word_at(self.text.char_at(&rn.ed.text, font, x)),
-            3 => rn.ed.select_all(),
-            _ => rn.ed.move_to(pos, shift),
-        }
-        rn.dragging = n == 1;
-        self.dirty = true;
-        true
+    /// The text field under the pointer, as drawn in the last frame.
+    fn field_at(&self, x: i32, y: i32) -> Option<FieldId> {
+        self.fields
+            .iter()
+            .rev()
+            .find(|f| f.1.contains(x, y))
+            .map(|f| f.0)
     }
 
-    /// The button held after a press in the field: select to the pointer.
-    fn rename_drag(&mut self, x: i32) {
-        let Some(i) = self.rename_row() else {
+    /// The editor behind a field, if that field is open.
+    fn field_edit(&mut self, id: FieldId) -> Option<&mut crate::edit::LineEdit> {
+        match id {
+            FieldId::Rename => self.rename.as_mut().map(|r| &mut r.ed),
+            FieldId::Bookmark => self.place_rename.as_mut().map(|(_, ed)| ed),
+            FieldId::Path => self.path_edit.as_mut(),
+            FieldId::Search => self.search_edit.as_mut(),
+            FieldId::Connect(k) => self.connect.as_mut().map(|f| match k {
+                0 => &mut f.uri,
+                1 => &mut f.user,
+                _ => &mut f.pass,
+            }),
+            FieldId::Batch(k) => {
+                self.batch
+                    .as_mut()
+                    .map(|b| if k == 0 { &mut b.find } else { &mut b.replace })
+            }
+        }
+    }
+
+    /// The text offset under pointer column `x` in a field. The password
+    /// is drawn as dots, so its offset is counted in characters.
+    fn field_offset(&mut self, id: FieldId, x: i32, word: bool) -> Option<usize> {
+        let origin = self.fields.iter().find(|f| f.0 == id)?.2;
+        let font = self.m.font;
+        let text = self.field_edit(id)?.text.clone();
+        let shown = match id {
+            FieldId::Connect(2) => mask(&text),
+            _ => text.clone(),
+        };
+        let at = if word {
+            self.text.char_at(&shown, font, x - origin)
+        } else {
+            self.text.offset_at(&shown, font, x - origin)
+        };
+        Some(match id {
+            FieldId::Connect(2) => unmask(&text, at),
+            _ => at,
+        })
+    }
+
+    /// A press in a text field: one press places the cursor (Shift
+    /// extends), two select a word, three the whole text. A field of a
+    /// dialog also takes the focus.
+    fn field_press(&mut self, id: FieldId, x: i32, shift: bool) {
+        // A press in another field ends a rename, as a press elsewhere does.
+        if id != FieldId::Rename && self.rename.is_some() {
+            self.commit_rename(false);
+        }
+        if id != FieldId::Bookmark && self.place_rename.is_some() {
+            self.commit_place_rename();
+        }
+        match id {
+            FieldId::Connect(k) => {
+                if let Some(f) = self.connect.as_mut() {
+                    f.field = k;
+                }
+            }
+            FieldId::Batch(k) => {
+                if let Some(b) = self.batch.as_mut() {
+                    b.field = k;
+                }
+            }
+            _ => {}
+        }
+        let n = match self.field_clicks {
+            Some((t, n, f)) if f == id && t.elapsed() < DOUBLE_CLICK => n % 3 + 1,
+            _ => 1,
+        };
+        self.field_clicks = Some((Instant::now(), n, id));
+        let pos = self.field_offset(id, x, n == 2);
+        if let (Some(pos), Some(ed)) = (pos, self.field_edit(id)) {
+            match n {
+                2 => ed.select_word_at(pos),
+                3 => ed.select_all(),
+                _ => ed.move_to(pos, shift),
+            }
+        }
+        self.field_drag = (n == 1).then_some(id);
+        self.dirty = true;
+    }
+
+    /// The button held after a press in a field: select to the pointer.
+    fn field_drag_to(&mut self, x: i32) {
+        let Some(id) = self.field_drag else {
             return;
         };
-        let fr = self.rename_field(i);
-        let (font, pad) = (self.m.font, self.m.pad);
-        let Some(rn) = self.rename.as_mut() else {
-            return;
-        };
-        let pos = self
-            .text
-            .offset_at(&rn.ed.text, font, x - (fr.x + pad / 2 - rn.scroll));
-        if pos != rn.ed.cursor {
-            rn.ed.move_to(pos, true);
-            self.dirty = true;
+        let pos = self.field_offset(id, x, false);
+        if let (Some(pos), Some(ed)) = (pos, self.field_edit(id)) {
+            if pos != ed.cursor {
+                ed.move_to(pos, true);
+                self.dirty = true;
+            }
         }
     }
 
@@ -3795,6 +3835,18 @@ impl App {
             ed.insert(&one_line(s, true));
             b.note = None;
         } else if let Some((_, ed)) = self.place_rename.as_mut() {
+            ed.insert(&one_line(s, false));
+        } else if let Some(f) = self.connect.as_mut() {
+            let ed = match f.field {
+                0 => &mut f.uri,
+                1 => &mut f.user,
+                _ => &mut f.pass,
+            };
+            ed.insert(&one_line(s, false));
+        } else if let Some(ed) = self.search_edit.as_mut() {
+            ed.insert(&one_line(s, false));
+            self.search_due = Some(Instant::now() + Duration::from_millis(180));
+        } else if let Some(ed) = self.path_edit.as_mut() {
             ed.insert(&one_line(s, false));
         }
         self.dirty = true;
@@ -4200,24 +4252,29 @@ impl App {
         self.cv.fill(fr, p.background);
         self.cv.frame(fr, p.accent);
         self.cv.reset_clip();
-        if let Some(mut rn) = self.rename.take() {
+        if let Some(rn) = self.rename.take() {
             let clip = fr.inset(1).intersect(&self.content);
-            rn.scroll = self.draw_edit(fr, clip, &rn.ed, rn.scroll, true);
+            self.draw_edit(FieldId::Rename, (fr, clip), &rn.ed, true);
             self.rename = Some(rn);
         }
     }
 
     /// A text field's text, selection and cursor in `fr`, drawn inside
-    /// `clip` and scrolled sideways so the cursor shows. Returns the scroll
-    /// to keep for the next frame.
+    /// `clip` and scrolled sideways so the cursor shows. The field is
+    /// remembered as `id`, so a press in it can place the cursor and the
+    /// next frame keeps its scroll.
     fn draw_edit(
         &mut self,
-        fr: Rect,
-        clip: Rect,
+        id: FieldId,
+        (fr, clip): (Rect, Rect),
         ed: &crate::edit::LineEdit,
-        scroll: i32,
         focus: bool,
-    ) -> i32 {
+    ) {
+        let scroll = self
+            .fields_prev
+            .iter()
+            .find(|f| f.0 == id)
+            .map_or(0, |f| f.3);
         let p = self.p;
         let (font, pad) = (self.m.font, self.m.pad);
         let inner = (fr.w - pad).max(1);
@@ -4231,6 +4288,7 @@ impl App {
         }
         scroll = scroll.min(cx).max(0);
         let (tx, ty) = (fr.x + pad / 2 - scroll, fr.y + (fr.h - font.height) / 2);
+        self.fields.push((id, clip, tx, scroll));
         self.cv.set_clip(clip);
         if ed.has_selection() {
             // Tinted with the accent: the item's own selection colour is
@@ -4249,7 +4307,6 @@ impl App {
                 .fill(Rect::new(tx + cx, ty, w, font.height), p.accent);
         }
         self.cv.reset_clip();
-        scroll
     }
 
     /// The dialog for renaming several items, with the new names ahead.
@@ -4304,7 +4361,7 @@ impl App {
             self.cv
                 .frame(fr, if k == b.field { p.accent } else { p.border });
             let ed = if k == 0 { &b.find } else { &b.replace };
-            self.draw_edit(fr, fr.inset(1), ed, 0, k == b.field);
+            self.draw_edit(FieldId::Batch(k), (fr, fr.inset(1)), ed, k == b.field);
             y += field_h + pad;
         }
         // The first new names, as they will be.
@@ -4754,9 +4811,9 @@ impl App {
         let uri = uri.unwrap_or_else(|| "sftp://".into());
         let user = std::env::var("USER").unwrap_or_default();
         self.connect = Some(ConnectForm {
-            uri,
-            user,
-            pass: String::new(),
+            uri: crate::edit::LineEdit::new(&uri),
+            user: crate::edit::LineEdit::new(&user),
+            pass: crate::edit::LineEdit::default(),
             field: if login { 2 } else { 0 },
             login,
             note,
@@ -4765,68 +4822,65 @@ impl App {
     }
 
     fn connect_key(&mut self, sym: u32, ctrl: bool, shift: bool) {
+        let ch = keysym_char(sym);
         let Some(f) = self.connect.as_mut() else {
             return;
         };
+        self.dirty = true;
         let fields = if f.login { 3 } else { 1 };
-        match sym {
-            0xff1b => self.connect = None,
-            0xff09 | 0xfe20 => {
+        let ed = match f.field {
+            0 => &mut f.uri,
+            1 => &mut f.user,
+            _ => &mut f.pass,
+        };
+        match ed.key(sym, ctrl, shift, ch) {
+            EditKey::Cancel => self.connect = None,
+            EditKey::Next(back) => {
                 // Tab: complete a host from ~/.ssh/config, or move field.
-                if f.field == 0 && f.uri.starts_with("sftp://") && !shift {
-                    let typed = f.uri["sftp://".len()..].to_string();
+                let typed = f.uri.text.strip_prefix("sftp://").map(str::to_string);
+                if let (0, Some(typed), false) = (f.field, typed, back) {
                     let hosts = crate::remote::ssh_hosts();
                     let mut hits: Vec<&String> =
                         hosts.iter().filter(|h| h.starts_with(&typed)).collect();
                     hits.sort();
                     if let Some(h) = hits.first() {
-                        f.uri = format!("sftp://{h}");
+                        f.uri.select_all();
+                        f.uri.insert(&format!("sftp://{h}"));
                     }
                 } else if fields > 1 {
-                    f.field = if shift {
+                    f.field = if back {
                         (f.field + fields - 1) % fields
                     } else {
                         (f.field + 1) % fields
                     };
                 }
             }
-            0xff0d | 0xff8d => {
-                let uri = f.uri.trim().to_string();
+            EditKey::Commit => {
+                let uri = f.uri.text.trim().to_string();
                 if !uri.contains("://") || uri.ends_with("://") {
                     f.note = Some(
                         "Type an address like sftp://host, ftp://host or smb://host/share".into(),
                     );
                 } else {
-                    let login = f.login.then(|| (f.user.clone(), f.pass.clone()));
+                    let login = f.login.then(|| (f.user.text.clone(), f.pass.text.clone()));
                     self.connect = None;
                     self.submit(crate::ops::Job::Connect { uri, login });
                 }
             }
-            0xff08 => {
-                let buf = match f.field {
-                    0 => &mut f.uri,
-                    1 => &mut f.user,
-                    _ => &mut f.pass,
-                };
-                if ctrl {
-                    buf.clear();
-                } else {
-                    buf.pop();
+            // A password is never copied out of its field.
+            EditKey::Copy | EditKey::Cut if f.field == 2 => {}
+            EditKey::Copy => {
+                let s = ed.selected().to_string();
+                self.copy_text(s);
+            }
+            EditKey::Cut => {
+                if let Some(s) = ed.cut() {
+                    self.copy_text(s);
                 }
             }
-            _ => {
-                if let Some(c) = keysym_char(sym) {
-                    if !c.is_control() {
-                        match f.field {
-                            0 => f.uri.push(c),
-                            1 => f.user.push(c),
-                            _ => f.pass.push(c),
-                        }
-                    }
-                }
-            }
+            EditKey::Paste => self.paste_text(),
+            EditKey::Edited | EditKey::Ignored => {}
         }
-        self.dirty = true;
     }
 
     fn draw_connect(&mut self) {
@@ -4835,10 +4889,8 @@ impl App {
         };
         let p = self.p;
         let (font, small, pad) = (self.m.font, self.m.small, self.m.pad);
-        let (uri, user, pass, field, login, note) = (
-            f.uri.clone(),
-            f.user.clone(),
-            f.pass.clone(),
+        let (eds, field, login, note) = (
+            [f.uri.clone(), f.user.clone(), masked(&f.pass)],
             f.field,
             f.login,
             f.note.clone(),
@@ -4881,25 +4933,7 @@ impl App {
             self.cv.fill(fr, p.background);
             self.cv
                 .frame(fr, if k == field { p.accent } else { p.border });
-            let value = match k {
-                0 => uri.clone(),
-                1 => user.clone(),
-                _ => "•".repeat(pass.chars().count()),
-            };
-            let shown = if k == field {
-                format!("{value}▏")
-            } else {
-                value
-            };
-            let shown = self.text.ellipsize(&shown, font, fr.w - 2 * pad);
-            self.text.draw(
-                &mut self.cv,
-                fr.x + pad,
-                fr.y + (fr.h - font.height) / 2,
-                &shown,
-                font,
-                p.foreground,
-            );
+            self.draw_edit(FieldId::Connect(k), (fr, fr.inset(1)), &eds[k], k == field);
             y += field_h + pad;
         }
         let hint =
@@ -5968,12 +6002,25 @@ impl App {
 }
 
 impl App {
-    fn search_key(&mut self, sym: u32, ctrl: bool) {
-        let Some(q) = self.search_edit.as_mut() else {
+    fn search_key(&mut self, sym: u32, ctrl: bool, shift: bool) {
+        let ch = keysym_char(sym);
+        let Some(ed) = self.search_edit.as_mut() else {
             return;
         };
-        match sym {
-            0xff1b => {
+        self.dirty = true;
+        // Down moves into the results, as Enter does.
+        let key = if sym == 0xff54 || sym == 0xff99 {
+            EditKey::Commit
+        } else {
+            let before = ed.text.clone();
+            let k = ed.key(sym, ctrl, shift, ch);
+            if ed.text != before {
+                self.search_due = Some(Instant::now() + Duration::from_millis(180));
+            }
+            k
+        };
+        match key {
+            EditKey::Cancel => {
                 // Esc: back to the folder.
                 self.search_edit = None;
                 self.search_due = None;
@@ -5982,34 +6029,28 @@ impl App {
                 self.searching = false;
                 let a = self.active;
                 self.load_tab(a, true);
-                return;
             }
-            0xff0d | 0xff8d | 0xff54 => {
-                // Enter or Down: keep the results, move into them.
-                self.search_edit = None;
+            EditKey::Commit => {
+                // Keep the results, move into them; a search still due
+                // for the last keys starts now.
+                let q = self.search_edit.take().map(|e| e.text).unwrap_or_default();
                 if self.search_due.take().is_some() {
-                    let q = self.tab().search.clone().unwrap_or_default();
-                    let _ = q;
+                    self.start_search(q);
                 }
             }
-            0xff08 => {
-                if ctrl {
-                    q.clear();
-                } else {
-                    q.pop();
-                }
-                self.search_due = Some(Instant::now() + Duration::from_millis(180));
+            EditKey::Copy => {
+                let s = ed.selected().to_string();
+                self.copy_text(s);
             }
-            _ => {
-                if let Some(c) = keysym_char(sym) {
-                    if !c.is_control() {
-                        q.push(c);
-                        self.search_due = Some(Instant::now() + Duration::from_millis(180));
-                    }
+            EditKey::Cut => {
+                if let Some(s) = ed.cut() {
+                    self.copy_text(s);
+                    self.search_due = Some(Instant::now() + Duration::from_millis(180));
                 }
             }
+            EditKey::Paste => self.paste_text(),
+            EditKey::Next(_) | EditKey::Edited | EditKey::Ignored => {}
         }
-        self.dirty = true;
     }
 
     /// Search names below the folder on a thread; results stream in.
@@ -6322,6 +6363,23 @@ impl App {
             p.muted,
         );
     }
+}
+
+/// A password as it is shown: one dot for each character.
+fn mask(s: &str) -> String {
+    "•".repeat(s.chars().count())
+}
+
+/// The offset in `s` of offset `at` in its mask.
+fn unmask(s: &str, at: usize) -> usize {
+    let n = at / '•'.len_utf8();
+    s.char_indices().nth(n).map_or(s.len(), |(i, _)| i)
+}
+
+/// An editor shown as its mask, with the cursor and selection in place.
+fn masked(ed: &crate::edit::LineEdit) -> crate::edit::LineEdit {
+    let dots = |i: usize| ed.text[..i].chars().count() * '•'.len_utf8();
+    crate::edit::LineEdit::selecting(&mask(&ed.text), dots(ed.anchor), dots(ed.cursor))
 }
 
 fn perm_string(mode: u32, dir: bool) -> String {
@@ -6682,6 +6740,41 @@ fn expand(s: &str) -> String {
 }
 
 /// Latin-1 and Unicode keysyms to characters.
+/// Tab in the path bar: `typed` with the folder name it starts completed
+/// as far as the folders there agree ("/" added when only one fits).
+fn complete_folder(typed: &str, hidden: bool) -> Option<String> {
+    let expanded = expand(typed);
+    let (dir, prefix) = match expanded.rfind('/') {
+        Some(i) => (expanded[..=i].to_string(), expanded[i + 1..].to_string()),
+        None => ("./".into(), expanded.clone()),
+    };
+    let mut names: Vec<String> = std::fs::read_dir(&dir)
+        .ok()?
+        .flatten()
+        .filter(|e| e.path().is_dir())
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .filter(|n| {
+            n.starts_with(&prefix) && (hidden || !n.starts_with('.') || prefix.starts_with('.'))
+        })
+        .collect();
+    names.sort_by(|a, b| dir::natural(a, b));
+    let first = names.first()?;
+    let common: String = names.iter().fold(first.clone(), |acc, n| {
+        acc.chars()
+            .zip(n.chars())
+            .take_while(|(a, b)| a == b)
+            .map(|(a, _)| a)
+            .collect()
+    });
+    let done = if names.len() == 1 {
+        format!("{common}/")
+    } else {
+        common
+    };
+    let base = typed.rfind('/').map_or("", |i| &typed[..=i]);
+    Some(format!("{base}{done}"))
+}
+
 fn keysym_char(sym: u32) -> Option<char> {
     match sym {
         0x20..=0x7e | 0xa0..=0xff => char::from_u32(sym),
@@ -7123,5 +7216,42 @@ mod tests {
         assert_eq!(expand("~"), h.display().to_string());
         assert_eq!(expand("~/x"), h.join("x").display().to_string());
         assert_eq!(expand("/etc"), "/etc");
+    }
+
+    #[test]
+    fn a_password_is_shown_as_dots_with_its_cursor() {
+        assert_eq!(mask("åb"), "••");
+        assert_eq!(unmask("åbc", 0), 0);
+        assert_eq!(unmask("åbc", 3), 2);
+        assert_eq!(unmask("åbc", 6), 3);
+        assert_eq!(unmask("åbc", 99), 4);
+        let ed = crate::edit::LineEdit::selecting("åbc", 2, 4);
+        let m = masked(&ed);
+        assert_eq!((m.anchor, m.cursor), (3, 9));
+    }
+
+    #[test]
+    fn tab_completes_a_folder_name() {
+        let d = std::env::temp_dir().join(format!("nirufm-complete-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        for sub in ["Music", "Mail one", "Mail two", ".hidden"] {
+            std::fs::create_dir_all(d.join(sub)).unwrap();
+        }
+        std::fs::write(d.join("Mufile"), "").unwrap();
+        let base = format!("{}/", d.display());
+        assert_eq!(
+            complete_folder(&format!("{base}Mu"), false),
+            Some(format!("{base}Music/"))
+        );
+        assert_eq!(
+            complete_folder(&format!("{base}Ma"), false),
+            Some(format!("{base}Mail "))
+        );
+        assert_eq!(complete_folder(&format!("{base}x"), false), None);
+        assert_eq!(
+            complete_folder(&format!("{base}.h"), false),
+            Some(format!("{base}.hidden/"))
+        );
+        let _ = std::fs::remove_dir_all(&d);
     }
 }

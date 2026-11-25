@@ -198,4 +198,36 @@ set -- $(row Alpha)
 xdotool mousemove "$1" "$2" click 1; sleep 0.6
 grep -q "^place " "$SB/c.err" || fail 'no rows'
 echo "bookmark order ok"
+
+# Text fields: the path bar completes with Tab and edits like any field;
+# a click places the cursor; the search field takes Home and typing.
+mkdir -p "$SB/t/alpha/inner" "$SB/t/beta"
+NIRUFM_PLACES=1 "$BIN" "$SB/t" 2>"$SB/t.err" &
+T=$!
+PIDS="$PIDS $T"
+sleep 1.2
+WT=$(xdotool search --pid "$T" | head -1)
+xdotool windowmove "$WT" 0 0; xdotool windowfocus --sync "$WT"; sleep 0.3
+field() { grep "^field $1 " "$SB/t.err" | tail -1; }
+state() { grep '^state ' "$SB/t.err" | tail -1; }
+k ctrl+l End
+xdotool type --delay 40 "/al"
+k Tab
+xdotool type --delay 40 "inn"
+k Tab Return
+state | grep -q "dir $SB/t/alpha/inner\$" || fail "path bar: $(state)"
+k ctrl+l
+set -- $(field Path); fx=$3; fy=$4
+xdotool mousemove $((fx + 30)) $((fy + 8)) click 1; sleep 0.4
+c=$(field Path | sed 's/.* cursor \([0-9]*\) anchor \([0-9]*\) .*/\1 \2/')
+set -- $c
+[ "$1" = "$2" ] && [ "$1" -gt 0 ] && [ "$1" -lt 10 ] || fail "a click in the path bar: $(field Path)"
+k Escape BackSpace BackSpace ctrl+f
+xdotool type --delay 40 "nn"
+k Home i
+field Search | grep -q 'text inn$' || fail "search field: $(field Search)"
+sleep 0.5
+state | grep -q '^state 0 selected 0 ' && fail "search found nothing"
+k Escape
+echo "text fields ok"
 echo "PASS"
