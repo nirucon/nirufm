@@ -39,8 +39,12 @@ Measured on the same machine in the same X server (Debian 13). A folder of
   shared with every other program.
 - **File operations** on a background thread with progress: copy, move,
   trash (freedesktop trash, restorable), delete, undo, rename. A copy is
-  written to a partial file first and nothing is ever overwritten: an existing
-  name gets " (2)".
+  written to a partial file first and nothing is overwritten unasked.
+- **Names that exist** when pasting, moving or dropping: you choose Replace,
+  Keep both (the new one gets " (2)"), Skip or, for a folder onto a folder,
+  Merge (asking again for names inside), with "apply to all remaining" for
+  the rest. A replaced item goes to the trash only after the new one is
+  complete, and Ctrl+Z brings it back.
 - **Rename** in place with F2: the name before the extension is selected,
   the field works like any text field (cursor keys, Ctrl+Left and
   Ctrl+Right, Shift to select, a click places the cursor, a double-click

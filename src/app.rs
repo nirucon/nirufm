@@ -105,6 +105,9 @@ enum Hit {
     Pane(usize),
     Eject(usize),
     MenuOutside,
+    /// A button of the dialog for a name that exists.
+    Answer(crate::ops::Choice),
+    AnswerAll,
 }
 
 struct Metrics {
@@ -162,6 +165,12 @@ pub struct App {
     wake: i32,
     running: Option<Running>,
     pending: usize,
+    /// The jobs sent to the worker, in its order: why each was sent and
+    /// its cancel flag. The first is the one running.
+    jobs: std::collections::VecDeque<(Origin, std::sync::Arc<std::sync::atomic::AtomicBool>)>,
+    /// A name that exists where a copy or move goes: the worker waits for
+    /// the answer, the window does not.
+    ask: Option<Ask>,
     undo: Vec<crate::ops::Undo>,
     clip: Option<(Vec<PathBuf>, bool)>,
     menu: Option<Menu>,
@@ -356,12 +365,28 @@ struct Props {
     sha: std::sync::Arc<std::sync::Mutex<Option<String>>>,
 }
 
+/// Why a job was sent, which decides where its undo step goes.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Origin {
+    New,
+    Undo,
+}
+
+/// The question for a name that exists, from the worker.
+struct Ask {
+    name: String,
+    folder: PathBuf,
+    existing: crate::ops::Side,
+    incoming: crate::ops::Side,
+    /// "Apply to all remaining" is ticked.
+    all: bool,
+}
+
 struct Running {
     verb: &'static str,
     done: u64,
     total: u64,
     current: String,
-    cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -509,6 +534,8 @@ impl App {
             rx,
             wake,
             running: None,
+            jobs: std::collections::VecDeque::new(),
+            ask: None,
             pending: 0,
             undo: Vec::new(),
             clip: None,
@@ -1109,6 +1136,9 @@ impl App {
                                     eprintln!("item {} {} {} {} {}", e.label, r.x, r.y, r.w, r.h);
                                 }
                             }
+                            Hit::Answer(c) => {
+                                eprintln!("answer {c:?} {} {}", r.x + r.w / 2, r.y + r.h / 2)
+                            }
                             _ => {}
                         }
                     }
@@ -1121,6 +1151,9 @@ impl App {
                                 r.x, r.y, r.w, r.h, ed.cursor, ed.anchor, ed.text
                             );
                         }
+                    }
+                    if let Some(a) = &self.ask {
+                        eprintln!("ask {} all {}", a.name, a.all);
                     }
                     let t = self.tab();
                     eprintln!(
@@ -1349,6 +1382,19 @@ impl App {
     fn button(&mut self, b: u8, x: i32, y: i32, state: KeyButMask) {
         let ctrl = state.contains(KeyButMask::CONTROL);
         let shift = state.contains(KeyButMask::SHIFT);
+        if self.ask.is_some() {
+            match (b, self.hit(x, y)) {
+                (1, Some(Hit::Answer(c))) => self.answer(c),
+                (1, Some(Hit::AnswerAll)) => {
+                    if let Some(a) = self.ask.as_mut() {
+                        a.all = !a.all;
+                    }
+                    self.dirty = true;
+                }
+                _ => {}
+            }
+            return;
+        }
         if self.gallery.is_some() {
             return self.gallery_button(b, x, y);
         }
@@ -1569,6 +1615,9 @@ impl App {
         let ctrl = state.contains(KeyButMask::CONTROL);
         let shift = state.contains(KeyButMask::SHIFT);
         let alt = state.contains(KeyButMask::MOD1);
+        if self.ask.is_some() {
+            return self.ask_key(sym);
+        }
         if self.gallery.is_some() {
             return self.gallery_key(sym, ctrl);
         }
@@ -1654,8 +1703,11 @@ impl App {
         match sym {
             0xff1b => {
                 // Escape: cancel a running job, else clear the selection.
-                if let Some(r) = &self.running {
-                    r.cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+                if self.running.is_some() {
+                    // The job running now, the first sent of those left.
+                    if let Some((_, cancel)) = self.jobs.front() {
+                        cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+                    }
                     self.flash("Cancelling…".into());
                 } else {
                     self.typed.clear();
@@ -2032,6 +2084,7 @@ impl App {
         self.draw_drop_target();
         if self.gallery.is_some() {
             self.draw_gallery();
+            self.draw_ask();
             return;
         }
         self.draw_preview();
@@ -2040,6 +2093,7 @@ impl App {
         self.draw_confirm();
         self.draw_connect();
         self.draw_batch();
+        self.draw_ask();
     }
 
     fn draw_sidebar(&mut self) {
@@ -2858,6 +2912,10 @@ impl App {
     }
 
     fn submit(&mut self, job: crate::ops::Job) {
+        self.submit_as(job, Origin::New);
+    }
+
+    fn submit_as(&mut self, job: crate::ops::Job, origin: Origin) {
         if self.running.is_none() {
             self.job_started = Some(Instant::now());
         }
@@ -2868,10 +2926,10 @@ impl App {
                 done: 0,
                 total: 0,
                 current: String::new(),
-                cancel: cancel.clone(),
             });
         }
         self.pending += 1;
+        self.jobs.push_back((origin, cancel.clone()));
         let _ = self.worker.tx.send((job, cancel));
         self.dirty = true;
     }
@@ -2932,6 +2990,20 @@ impl App {
         }
         while let Ok(m) = self.rx.try_recv() {
             match m {
+                crate::ops::Msg::Ask {
+                    name,
+                    folder,
+                    existing,
+                    incoming,
+                } => {
+                    self.ask = Some(Ask {
+                        name,
+                        folder,
+                        existing,
+                        incoming,
+                        all: false,
+                    });
+                }
                 crate::ops::Msg::Progress {
                     done,
                     total,
@@ -2951,6 +3023,8 @@ impl App {
                     open,
                     login,
                 } => {
+                    let origin = self.jobs.pop_front().map_or(Origin::New, |j| j.0);
+                    self.ask = None;
                     if let Some(uri) = login {
                         self.pending = self.pending.saturating_sub(1);
                         if self.pending == 0 {
@@ -2967,10 +3041,7 @@ impl App {
                         self.running = None;
                     }
                     if let Some(u) = undo {
-                        self.undo.push(u);
-                        if self.undo.len() > 50 {
-                            self.undo.remove(0);
-                        }
+                        self.remember_undo(u, origin);
                     }
                     self.select_after = created;
                     if let Some(dir) = open {
@@ -3379,50 +3450,28 @@ impl App {
         self.paste_files(files, cut);
     }
 
+    /// An undo step from a finished job.
+    fn remember_undo(&mut self, u: crate::ops::Undo, origin: Origin) {
+        match origin {
+            Origin::New => {
+                self.undo.push(u);
+                if self.undo.len() > 50 {
+                    self.undo.remove(0);
+                }
+            }
+            // Undoing returns how to do it again: kept for redo later.
+            Origin::Undo => {}
+        }
+    }
+
+    /// Ctrl+Z: the last operation taken back on the worker, which also
+    /// says how to do it again.
     fn undo_last(&mut self) {
-        let Some(u) = self.undo.pop() else {
+        let Some(undo) = self.undo.pop() else {
             self.flash("Nothing to undo".into());
             return;
         };
-        match u {
-            crate::ops::Undo::MoveBack(pairs) => {
-                // Each item goes back to its own folder (or name), never
-                // over a file that took its place meanwhile.
-                let moves: Vec<(PathBuf, PathBuf)> = pairs
-                    .into_iter()
-                    .filter(|(now, _)| std::fs::symlink_metadata(now).is_ok())
-                    .collect();
-                let done = match crate::ops::rename_all(&moves) {
-                    Ok(()) => {
-                        let n = moves.len();
-                        self.error = false;
-                        self.flash(format!(
-                            "Undone: {n} item{} moved back",
-                            if n == 1 { "" } else { "s" }
-                        ));
-                        moves
-                    }
-                    Err((done, msg)) => {
-                        self.flash_error(msg);
-                        done
-                    }
-                };
-                let a = self.active;
-                self.load_tab(a, false);
-                self.select_after = done.into_iter().map(|(_, orig)| orig).collect();
-                self.apply_select_after();
-            }
-            crate::ops::Undo::Untrash(v) => self.submit(crate::ops::Job::Restore { pairs: v }),
-            crate::ops::Undo::TrashCreated(v) => {
-                let v: Vec<PathBuf> = v
-                    .into_iter()
-                    .filter(|p| std::fs::symlink_metadata(p).is_ok())
-                    .collect();
-                if !v.is_empty() {
-                    self.submit(crate::ops::Job::Trash { paths: v });
-                }
-            }
-        }
+        self.submit_as(crate::ops::Job::Revert { undo }, Origin::Undo);
     }
 
     /// Open a place of the side panel: go there, mount it or connect.
@@ -6414,6 +6463,180 @@ fn group_name(gid: u32) -> String {
 }
 
 impl App {
+    /// Keys of the dialog for a name that exists: the first letter of each
+    /// choice, A for "apply to all", Enter keeps both, Esc stops the job.
+    fn ask_key(&mut self, sym: u32) {
+        use crate::ops::Choice;
+        let folders = self
+            .ask
+            .as_ref()
+            .is_some_and(|a| a.existing.is_dir && a.incoming.is_dir);
+        match sym | 0x20 {
+            0x72 => self.answer(Choice::Replace),          // r
+            0x73 => self.answer(Choice::Skip),             // s
+            0x6b => self.answer(Choice::KeepBoth),         // k
+            0x6d if folders => self.answer(Choice::Merge), // m
+            0x61 => {
+                // a
+                if let Some(a) = self.ask.as_mut() {
+                    a.all = !a.all;
+                }
+            }
+            _ => match sym {
+                0xff0d | 0xff8d => self.answer(Choice::KeepBoth),
+                0xff1b => {
+                    // Stop the job: what is done stays done (and undoable).
+                    if let Some((_, cancel)) = self.jobs.front() {
+                        cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+                    }
+                    self.answer(Choice::Skip);
+                    self.flash("Cancelling…".into());
+                }
+                _ => {}
+            },
+        }
+        self.dirty = true;
+    }
+
+    fn answer(&mut self, choice: crate::ops::Choice) {
+        let Some(a) = self.ask.take() else {
+            return;
+        };
+        let _ = self
+            .worker
+            .answer
+            .send(crate::ops::Answer { choice, all: a.all });
+        self.dirty = true;
+    }
+
+    /// The dialog for a name that exists where an item is pasted, moved or
+    /// dropped.
+    fn draw_ask(&mut self) {
+        let Some(a) = self.ask.as_ref() else {
+            return;
+        };
+        use crate::ops::Choice;
+        let p = self.p;
+        let (font, small, pad) = (self.m.font, self.m.small, self.m.pad);
+        let folders = a.existing.is_dir && a.incoming.is_dir;
+        let what = if a.existing.is_dir {
+            "A folder"
+        } else {
+            "A file"
+        };
+        let lines = [
+            format!(
+                "{what} named \"{}\" is already in {}.",
+                a.name,
+                places::pretty(&a.folder)
+            ),
+            format!("Existing: {}", side_text(&a.existing)),
+            format!("New:      {}", side_text(&a.incoming)),
+        ];
+        let all = a.all;
+        let mut buttons = vec![(Choice::Replace, "R  Replace")];
+        if folders {
+            buttons.push((Choice::Merge, "M  Merge"));
+        }
+        buttons.push((Choice::KeepBoth, "K  Keep both"));
+        buttons.push((Choice::Skip, "S  Skip"));
+        let w = (self.cv.w * 2 / 3)
+            .clamp((420.0 * self.m.s) as i32, (680.0 * self.m.s) as i32)
+            .min(self.cv.w - 2 * pad);
+        let bh = font.height + pad;
+        let h = 4 * pad
+            + font.height
+            + 3 * (small.height + pad / 3)
+            + 2 * pad
+            + bh
+            + 2 * (small.height + pad / 2);
+        let r = Rect::new((self.cv.w - w) / 2, ((self.cv.h - h) / 3).max(0), w, h);
+        self.cv
+            .tint(Rect::new(0, 0, self.cv.w, self.cv.h), p.background, 140);
+        let sh = (4.0 * self.m.s) as i32;
+        self.cv
+            .tint(Rect::new(r.x + sh, r.y + sh, r.w, r.h), 0x000000, 120);
+        self.cv.fill(r, p.surface);
+        self.cv.frame(r, p.warning);
+        // Everything outside the dialog is inert while it is open.
+        self.hits
+            .push((Rect::new(0, 0, self.cv.w, self.cv.h), Hit::MenuOutside));
+        let mut y = r.y + 2 * pad;
+        crate::logo::word(
+            &mut self.cv,
+            r.x + 2 * pad,
+            y,
+            "NAME EXISTS",
+            (2.0 * self.m.s).round().max(2.0) as i32,
+            p.warning,
+            None,
+        );
+        y += font.height + pad;
+        for (k, line) in lines.iter().enumerate() {
+            let line = self.text.ellipsize(line, small, r.w - 4 * pad);
+            let col = if k == 0 { p.foreground } else { p.muted };
+            self.text
+                .draw(&mut self.cv, r.x + 2 * pad, y, &line, small, col);
+            y += small.height + pad / 3;
+        }
+        y += pad;
+        let mut x = r.x + 2 * pad;
+        for (c, label) in buttons {
+            let bw = self.text.width(label, font) + 2 * pad;
+            let br = Rect::new(x, y, bw, bh);
+            self.cv.fill(br, p.background);
+            self.cv.frame(
+                br,
+                if c == Choice::KeepBoth {
+                    p.accent
+                } else {
+                    p.border
+                },
+            );
+            self.text.draw(
+                &mut self.cv,
+                br.x + pad,
+                br.y + pad / 2,
+                label,
+                font,
+                p.foreground,
+            );
+            self.hits.push((br, Hit::Answer(c)));
+            x += bw + pad;
+        }
+        y += bh + pad;
+        let mark = if all { "[x]" } else { "[ ]" };
+        let label = format!("{mark} A  Apply to all remaining conflicts");
+        let tw = self
+            .text
+            .draw(&mut self.cv, r.x + 2 * pad, y, &label, small, p.foreground);
+        self.hits.push((
+            Rect::new(r.x + 2 * pad, y, tw, small.height),
+            Hit::AnswerAll,
+        ));
+        y += small.height + pad / 2;
+        let hint = if folders {
+            "Merge puts the contents together and asks about names inside · Enter keep both · Esc stop"
+        } else {
+            "Replace moves the existing one to the trash · Enter keep both · Esc stop"
+        };
+        let hint = self.text.ellipsize(hint, small, r.w - 4 * pad);
+        self.text
+            .draw(&mut self.cv, r.x + 2 * pad, y, &hint, small, p.muted);
+    }
+}
+
+/// "12 kB, changed 2026-11-20 14:02" for the dialog of a name that exists.
+fn side_text(s: &crate::ops::Side) -> String {
+    let what = if s.is_dir {
+        "folder".to_string()
+    } else {
+        dir::human_size(s.size)
+    };
+    format!("{what}, changed {}", dir::human_time(s.mtime))
+}
+
+impl App {
     /// Online NIRUSHARE devices, asked for in the background.
     fn refresh_share_hosts(&self) {
         if !crate::archive::have("nirushare") {
@@ -6529,6 +6752,10 @@ impl App {
                     ("Delete", "to the trash"),
                     ("Shift+Delete", "delete for good"),
                     ("Ctrl+Z", "undo"),
+                    (
+                        "R, K, S, M, A",
+                        "name exists: replace, keep both, skip, merge, all",
+                    ),
                     ("F2", "rename (several: find, replace, {n})"),
                     ("Ctrl+Shift+N", "new folder"),
                     ("Alt+Enter", "properties"),

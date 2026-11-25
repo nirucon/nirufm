@@ -4,7 +4,9 @@
 //! - a copy is written to a hidden partial file and renamed into place only
 //!   when complete, so an interrupted copy never looks like a finished file;
 //! - a move across file systems deletes the source only after the copy;
-//! - nothing is ever overwritten: a name that exists gets " (2)", " (3)"...;
+//! - nothing is overwritten unasked: when a name exists the user chooses to
+//!   replace, skip, keep both (" (2)", " (3)"...) or merge two folders, and
+//!   a replaced item goes to the trash only once its successor is complete;
 //! - "delete" means the freedesktop trash, which other file managers share;
 //!   permanent deletion is a separate, confirmed action.
 use std::fs;
@@ -12,7 +14,7 @@ use std::io::{Read, Write};
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::Sender;
+use std::sync::mpsc::{Receiver, Sender};
 use std::sync::Arc;
 
 #[derive(Clone, Debug)]
@@ -55,6 +57,10 @@ pub enum Job {
     Disconnect {
         uri: String,
     },
+    /// Take an operation back (or, with what that returned, do it again).
+    Revert {
+        undo: Undo,
+    },
 }
 
 impl Job {
@@ -71,6 +77,7 @@ impl Job {
             Job::Eject { .. } => "Ejecting",
             Job::Connect { .. } => "Connecting",
             Job::Disconnect { .. } => "Disconnecting",
+            Job::Revert { .. } => "Undoing",
         }
     }
 }
@@ -84,9 +91,77 @@ pub enum Undo {
     Untrash(Vec<(PathBuf, PathBuf, PathBuf)>),
     /// Copies and new items go to the trash.
     TrashCreated(Vec<PathBuf>),
+    /// Several of these, taken back in this order.
+    Steps(Vec<Undo>),
+}
+
+impl Undo {
+    /// Several steps as one, leaving out the empty ones.
+    fn steps(v: Vec<Undo>) -> Option<Undo> {
+        let mut v: Vec<Undo> = v.into_iter().filter(|u| !u.is_empty()).collect();
+        match v.len() {
+            0 => None,
+            1 => v.pop(),
+            _ => Some(Undo::Steps(v)),
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        match self {
+            Undo::MoveBack(v) => v.is_empty(),
+            Undo::Untrash(v) => v.is_empty(),
+            Undo::TrashCreated(v) => v.is_empty(),
+            Undo::Steps(v) => v.iter().all(Undo::is_empty),
+        }
+    }
+}
+
+/// What to do when an item of the same name is where another goes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Choice {
+    Replace,
+    Skip,
+    KeepBoth,
+    /// Folder onto folder: the contents go in alongside, asking again for
+    /// each name inside that exists too.
+    Merge,
+}
+
+/// The user's answer to `Msg::Ask`; `all` applies it to the conflicts
+/// still to come in this job (Merge only to folders).
+#[derive(Clone, Copy, Debug)]
+pub struct Answer {
+    pub choice: Choice,
+    pub all: bool,
+}
+
+/// One side of a conflict, to choose by.
+#[derive(Clone, Debug)]
+pub struct Side {
+    pub is_dir: bool,
+    pub size: u64,
+    pub mtime: i64,
+}
+
+impl Side {
+    fn of(p: &Path) -> Side {
+        let m = fs::symlink_metadata(p).ok();
+        Side {
+            is_dir: m.as_ref().is_some_and(|m| m.is_dir()),
+            size: m.as_ref().map_or(0, |m| m.len()),
+            mtime: m.as_ref().map_or(0, |m| m.mtime()),
+        }
+    }
 }
 
 pub enum Msg {
+    /// `name` exists in `folder`: the worker waits for an `Answer`.
+    Ask {
+        name: String,
+        folder: PathBuf,
+        existing: Side,
+        incoming: Side,
+    },
     Progress {
         done: u64,
         total: u64,
@@ -108,16 +183,20 @@ pub type Queued = (Job, Arc<AtomicBool>);
 
 pub struct Worker {
     pub tx: Sender<Queued>,
+    /// Answers to `Msg::Ask`.
+    pub answer: Sender<Answer>,
 }
 
 /// Start the worker. `wake` is written to after every message so the event
 /// loop's `poll` returns.
 pub fn start(out: Sender<Msg>, wake: i32) -> Worker {
     let (tx, rx) = std::sync::mpsc::channel::<Queued>();
+    let (answer, answers) = std::sync::mpsc::channel::<Answer>();
     std::thread::spawn(move || {
         for (job, cancel) in rx {
             let mut run = Run {
                 out: &out,
+                answers: &answers,
                 wake,
                 done: 0,
                 total: 0,
@@ -125,6 +204,8 @@ pub fn start(out: Sender<Msg>, wake: i32) -> Worker {
                 errors: Vec::new(),
                 last: std::time::Instant::now(),
                 needs_login: false,
+                all_files: None,
+                all_dirs: None,
             };
             let mount = matches!(job, Job::Mount { .. } | Job::Connect { .. });
             let wants_login = match &job {
@@ -148,7 +229,7 @@ pub fn start(out: Sender<Msg>, wake: i32) -> Worker {
             poke(wake);
         }
     });
-    Worker { tx }
+    Worker { tx, answer }
 }
 
 pub fn poke(fd: i32) {
@@ -158,6 +239,7 @@ pub fn poke(fd: i32) {
 
 struct Run<'a> {
     out: &'a Sender<Msg>,
+    answers: &'a Receiver<Answer>,
     wake: i32,
     done: u64,
     total: u64,
@@ -165,6 +247,22 @@ struct Run<'a> {
     errors: Vec<String>,
     last: std::time::Instant,
     needs_login: bool,
+    /// "Apply to all" answers for the rest of the job: for files (and
+    /// anything that is not folder onto folder), and for folders.
+    all_files: Option<Choice>,
+    all_dirs: Option<Choice>,
+}
+
+/// What a copy or move did, to report and to undo.
+#[derive(Default)]
+struct Moved {
+    /// Copies made (top level, or inside a merged folder).
+    made: Vec<PathBuf>,
+    /// Moved items: (now, where they were).
+    moved: Vec<(PathBuf, PathBuf)>,
+    /// Items replaced, now in the trash.
+    replaced: Vec<(PathBuf, PathBuf, PathBuf)>,
+    skipped: usize,
 }
 
 impl Run<'_> {
@@ -193,62 +291,12 @@ impl Run<'_> {
 
     fn job(&mut self, job: Job) -> (String, Option<Undo>, Vec<PathBuf>) {
         match job {
-            Job::Copy { srcs, dst } => {
-                self.total = srcs.iter().map(|p| tree_size(p)).sum();
-                let mut made = Vec::new();
-                for s in &srcs {
-                    if self.cancelled() {
-                        break;
-                    }
-                    if dst.starts_with(s) {
-                        self.fail(s, "cannot copy a folder into itself");
-                        continue;
-                    }
-                    let target = free_name(&dst, s);
-                    match self.copy_tree(s, &target) {
-                        Ok(()) => made.push(target),
-                        Err(e) => {
-                            self.fail(s, e);
-                            let _ = remove_tree(&target);
-                        }
-                    }
-                }
-                let n = made.len();
-                (
-                    format!("Copied {n} item{}", plural(n)),
-                    Some(Undo::TrashCreated(made.clone())),
-                    made,
-                )
-            }
-            Job::Move { srcs, dst } => {
-                self.total = srcs.len() as u64;
-                let mut pairs = Vec::new();
-                for s in &srcs {
-                    if self.cancelled() {
-                        break;
-                    }
-                    if s.parent() == Some(dst.as_path()) {
-                        continue;
-                    }
-                    if dst.starts_with(s) {
-                        self.fail(s, "cannot move a folder into itself");
-                        continue;
-                    }
-                    let target = free_name(&dst, s);
-                    match self.move_one(s, &target) {
-                        Ok(()) => pairs.push((target, s.clone())),
-                        Err(e) => self.fail(s, e),
-                    }
-                    self.done += 1;
-                    self.progress(s, false);
-                }
-                let n = pairs.len();
-                let created = pairs.iter().map(|(t, _)| t.clone()).collect();
-                (
-                    format!("Moved {n} item{}", plural(n)),
-                    Some(Undo::MoveBack(pairs)),
-                    created,
-                )
+            Job::Copy { srcs, dst } => self.transfer(&srcs, &dst, false),
+            Job::Move { srcs, dst } => self.transfer(&srcs, &dst, true),
+            Job::Revert { undo } => {
+                let back = self.revert(undo);
+                let created = back.as_ref().map(touched).unwrap_or_default();
+                ("Undone".into(), back, created)
             }
             Job::Trash { paths } => {
                 self.total = paths.len() as u64;
@@ -289,26 +337,14 @@ impl Run<'_> {
                 )
             }
             Job::Restore { pairs } => {
-                let mut n = 0;
                 let mut created = Vec::new();
                 for (file, info, orig) in &pairs {
-                    let target = if orig.exists() {
-                        free_name(orig.parent().unwrap_or(Path::new("/")), orig)
-                    } else {
-                        orig.clone()
-                    };
-                    if let Some(parent) = target.parent() {
-                        let _ = fs::create_dir_all(parent);
-                    }
-                    match self.move_one(file, &target) {
-                        Ok(()) => {
-                            let _ = fs::remove_file(info);
-                            created.push(target);
-                            n += 1;
-                        }
+                    match self.restore_one(file, info, orig) {
+                        Ok(target) => created.push(target),
                         Err(e) => self.fail(file, e),
                     }
                 }
+                let n = created.len();
                 (format!("Restored {n} item{}", plural(n)), None, created)
             }
             Job::Extract { archive, dst } => match crate::archive::extract(&archive, &dst) {
@@ -380,6 +416,328 @@ impl Run<'_> {
                     ("Packing failed".into(), None, Vec::new())
                 }
             },
+        }
+    }
+
+    /// Copy or move `srcs` into `dst`, asking about each name that exists.
+    fn transfer(
+        &mut self,
+        srcs: &[PathBuf],
+        dst: &Path,
+        mov: bool,
+    ) -> (String, Option<Undo>, Vec<PathBuf>) {
+        self.total = if mov {
+            srcs.len() as u64
+        } else {
+            srcs.iter().map(|p| tree_size(p)).sum()
+        };
+        let mut m = Moved::default();
+        for s in srcs {
+            if self.cancelled() {
+                break;
+            }
+            if mov && s.parent() == Some(dst) {
+                continue;
+            }
+            if dst.starts_with(s) {
+                let verb = if mov { "move" } else { "copy" };
+                self.fail(s, format!("cannot {verb} a folder into itself"));
+                continue;
+            }
+            let Some(name) = s.file_name() else {
+                self.fail(s, "cannot copy or move this");
+                continue;
+            };
+            self.place(s, &dst.join(name), mov, &mut m);
+            if mov {
+                self.done += 1;
+                self.progress(s, false);
+            }
+        }
+        let n = if mov { m.moved.len() } else { m.made.len() };
+        let mut notes = Vec::new();
+        if !m.replaced.is_empty() {
+            notes.push(format!("{} replaced", m.replaced.len()));
+        }
+        if m.skipped > 0 {
+            notes.push(format!("{} skipped", m.skipped));
+        }
+        let summary = format!(
+            "{} {n} item{}{}",
+            if mov { "Moved" } else { "Copied" },
+            plural(n),
+            if notes.is_empty() {
+                String::new()
+            } else {
+                format!(" ({})", notes.join(", "))
+            }
+        );
+        let (undo, created) = if mov {
+            let created = m.moved.iter().map(|(t, _)| t.clone()).collect();
+            (Undo::MoveBack(m.moved), created)
+        } else {
+            (Undo::TrashCreated(m.made.clone()), m.made)
+        };
+        (
+            summary,
+            Undo::steps(vec![undo, Undo::Untrash(m.replaced)]),
+            created,
+        )
+    }
+
+    /// `s` to `t`: straight there when the name is free, else as the user
+    /// chooses.
+    fn place(&mut self, s: &Path, t: &Path, mov: bool, m: &mut Moved) {
+        let dir = t.parent().unwrap_or(Path::new("/"));
+        if fs::symlink_metadata(t).is_err() {
+            return self.put(s, t, mov, m);
+        }
+        if same_file(s, t) {
+            // Pasted where it is: a copy goes beside it, a move is done.
+            if !mov {
+                let t = free_name(dir, s);
+                self.put(s, &t, mov, m);
+            }
+            return;
+        }
+        let (existing, incoming) = (Side::of(t), Side::of(s));
+        let folders = existing.is_dir && incoming.is_dir;
+        match self.choose(t, existing, incoming) {
+            Choice::Skip => m.skipped += 1,
+            Choice::KeepBoth => {
+                let t = free_name(dir, s);
+                self.put(s, &t, mov, m);
+            }
+            Choice::Merge if folders => self.merge(s, t, mov, m),
+            // Merge is offered only for two folders.
+            Choice::Merge => m.skipped += 1,
+            Choice::Replace => self.replace(s, t, mov, m),
+        }
+    }
+
+    /// `s` to the free name `t`.
+    fn put(&mut self, s: &Path, t: &Path, mov: bool, m: &mut Moved) {
+        let result = if mov {
+            self.move_one(s, t)
+        } else {
+            self.copy_tree(s, t)
+        };
+        match result {
+            Ok(()) if mov => m.moved.push((t.to_path_buf(), s.to_path_buf())),
+            Ok(()) => m.made.push(t.to_path_buf()),
+            Err(e) => {
+                // What was made of it goes, unless the name was taken by
+                // someone else meanwhile.
+                if !mov && e.kind() != std::io::ErrorKind::AlreadyExists {
+                    let _ = remove_tree(t);
+                }
+                self.fail(s, e);
+            }
+        }
+    }
+
+    /// The choice for a name that exists: remembered from "apply to all",
+    /// else asked. The window stays live meanwhile; only this job waits.
+    fn choose(&mut self, t: &Path, existing: Side, incoming: Side) -> Choice {
+        let folders = existing.is_dir && incoming.is_dir;
+        if let Some(c) = if folders {
+            self.all_dirs
+        } else {
+            self.all_files
+        } {
+            return c;
+        }
+        if self.cancelled() {
+            return Choice::Skip;
+        }
+        // An answer left over from an earlier question is not for this one.
+        while self.answers.try_recv().is_ok() {}
+        let _ = self.out.send(Msg::Ask {
+            name: t
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default(),
+            folder: t.parent().map(Path::to_path_buf).unwrap_or_default(),
+            existing,
+            incoming,
+        });
+        poke(self.wake);
+        let a = self.answers.recv().unwrap_or(Answer {
+            choice: Choice::Skip,
+            all: true,
+        });
+        if a.all {
+            if a.choice == Choice::Merge {
+                self.all_dirs = Some(Choice::Merge);
+            } else {
+                self.all_files = Some(a.choice);
+                self.all_dirs.get_or_insert(a.choice);
+            }
+        }
+        // A pause to answer is not part of the copy's speed.
+        self.last = std::time::Instant::now();
+        a.choice
+    }
+
+    /// Put `s` in the place of `t`. The successor is made complete first
+    /// (moved within the drive, else copied under a hidden name beside
+    /// `t`); only then does `t` go to the trash, so it can come back.
+    fn replace(&mut self, s: &Path, t: &Path, mov: bool, m: &mut Moved) {
+        if s.starts_with(t) {
+            self.fail(s, "cannot replace a folder with something inside it");
+            return;
+        }
+        let dir = t.parent().unwrap_or(Path::new("/"));
+        let dev = |p: &Path| fs::metadata(p).map(|m| m.dev()).ok();
+        let in_place = mov && dev(s).is_some() && dev(s) == dev(dir);
+        let temp = dir.join(format!(
+            ".{}.nirufm-new-{}",
+            t.file_name().unwrap_or_default().to_string_lossy(),
+            std::process::id()
+        ));
+        if !in_place {
+            if mov {
+                self.total += tree_size(s);
+            }
+            if let Err(e) = self.copy_tree(s, &temp) {
+                let _ = remove_tree(&temp);
+                return self.fail(s, e);
+            }
+        }
+        let new = if in_place { s } else { temp.as_path() };
+        let old = match trash(t) {
+            Ok(old) => old,
+            Err(e) => {
+                if !in_place {
+                    let _ = remove_tree(&temp);
+                }
+                return self.fail(t, format!("kept, it could not go to the trash ({e})"));
+            }
+        };
+        if let Err(e) = rename_noreplace(new, t) {
+            // The old one comes back from the trash.
+            if rename_noreplace(&old.0, t).is_ok() {
+                let _ = fs::remove_file(&old.1);
+            }
+            if !in_place {
+                let _ = remove_tree(&temp);
+            }
+            return self.fail(s, e);
+        }
+        m.replaced.push(old);
+        if !mov {
+            m.made.push(t.to_path_buf());
+            return;
+        }
+        if !in_place {
+            if let Err(e) = remove_tree(s) {
+                self.fail(s, format!("copied, but the original stayed: {e}"));
+            }
+        }
+        m.moved.push((t.to_path_buf(), s.to_path_buf()));
+    }
+
+    /// Folder `s` into folder `t`: each item inside placed as at the top.
+    /// A move removes `s` when it is left empty.
+    fn merge(&mut self, s: &Path, t: &Path, mov: bool, m: &mut Moved) {
+        let items: Vec<PathBuf> = match fs::read_dir(s) {
+            Ok(rd) => rd.flatten().map(|e| e.path()).collect(),
+            Err(e) => return self.fail(s, e),
+        };
+        for c in items {
+            if self.cancelled() {
+                return;
+            }
+            if let Some(name) = c.file_name() {
+                self.place(&c, &t.join(name), mov, m);
+            }
+        }
+        if mov {
+            let _ = fs::remove_dir(s);
+        }
+    }
+
+    /// Back from the trash to `orig`, or beside it when the name was taken.
+    fn restore_one(&mut self, file: &Path, info: &Path, orig: &Path) -> std::io::Result<PathBuf> {
+        let target = if fs::symlink_metadata(orig).is_ok() {
+            free_name(orig.parent().unwrap_or(Path::new("/")), orig)
+        } else {
+            orig.to_path_buf()
+        };
+        if let Some(parent) = target.parent() {
+            let _ = fs::create_dir_all(parent);
+        }
+        self.move_one(file, &target)?;
+        let _ = fs::remove_file(info);
+        Ok(target)
+    }
+
+    /// Take `undo` back. Returns how to do it again (for redo).
+    fn revert(&mut self, undo: Undo) -> Option<Undo> {
+        match undo {
+            Undo::MoveBack(pairs) => {
+                // Each item goes back to its own folder (or name), never
+                // over an item that took its place meanwhile.
+                let pairs: Vec<(PathBuf, PathBuf)> = pairs
+                    .into_iter()
+                    .filter(|(now, _)| fs::symlink_metadata(now).is_ok())
+                    .collect();
+                for (_, orig) in &pairs {
+                    if let Some(p) = orig.parent() {
+                        let _ = fs::create_dir_all(p);
+                    }
+                }
+                let dev = |p: &Path| fs::symlink_metadata(p).map(|m| m.dev()).ok();
+                let (near, far): (Vec<_>, Vec<_>) = pairs
+                    .into_iter()
+                    .partition(|(now, orig)| dev(now) == orig.parent().and_then(dev));
+                let mut done = match rename_all(&near) {
+                    Ok(()) => near,
+                    Err((done, msg)) => {
+                        self.errors.push(msg);
+                        done
+                    }
+                };
+                // Another drive: copied back, as the move went.
+                for (now, orig) in far {
+                    if fs::symlink_metadata(&orig).is_ok() {
+                        self.errors
+                            .push(format!("\"{}\" already exists", orig.display()));
+                    } else {
+                        match self.move_one(&now, &orig) {
+                            Ok(()) => done.push((now, orig)),
+                            Err(e) => self.fail(&now, e),
+                        }
+                    }
+                }
+                let again = done.into_iter().map(|(now, orig)| (orig, now)).collect();
+                Undo::steps(vec![Undo::MoveBack(again)])
+            }
+            Undo::Untrash(v) => {
+                let mut back = Vec::new();
+                for (file, info, orig) in &v {
+                    match self.restore_one(file, info, orig) {
+                        Ok(t) => back.push(t),
+                        Err(e) => self.fail(file, e),
+                    }
+                }
+                Undo::steps(vec![Undo::TrashCreated(back)])
+            }
+            Undo::TrashCreated(v) => {
+                let mut gone = Vec::new();
+                for p in v.iter().filter(|p| fs::symlink_metadata(p).is_ok()) {
+                    match trash(p) {
+                        Ok(t) => gone.push(t),
+                        Err(e) => self.fail(p, e),
+                    }
+                }
+                Undo::steps(vec![Undo::Untrash(gone)])
+            }
+            Undo::Steps(v) => {
+                let mut again: Vec<Undo> = v.into_iter().filter_map(|u| self.revert(u)).collect();
+                again.reverse();
+                Undo::steps(again)
+            }
         }
     }
 
@@ -463,6 +821,16 @@ impl Run<'_> {
             let _ = fs::remove_file(&part);
         }
         result
+    }
+}
+
+/// The items an undo step leaves in place, to select after it.
+fn touched(u: &Undo) -> Vec<PathBuf> {
+    match u {
+        Undo::MoveBack(v) => v.iter().map(|(now, _)| now.clone()).collect(),
+        Undo::TrashCreated(v) => v.clone(),
+        Undo::Untrash(_) => Vec::new(),
+        Undo::Steps(v) => v.iter().flat_map(touched).collect(),
     }
 }
 
@@ -823,7 +1191,16 @@ pub fn rename_error(e: &std::io::Error, old: &str, new: &str) -> String {
 mod tests {
     use super::*;
 
+    /// One trash for all tests of this run, never the user's: tests run
+    /// side by side, so it is the same path for each of them.
+    fn private_trash() -> PathBuf {
+        let data = std::env::temp_dir().join(format!("nirufm-ops-data-{}", std::process::id()));
+        std::env::set_var("XDG_DATA_HOME", &data);
+        data
+    }
+
     fn tmp(name: &str) -> PathBuf {
+        private_trash();
         let d = std::env::temp_dir().join(format!("nirufm-ops-{name}-{}", std::process::id()));
         let _ = fs::remove_dir_all(&d);
         fs::create_dir_all(&d).unwrap();
@@ -831,22 +1208,45 @@ mod tests {
     }
 
     fn run(job: Job) -> (String, Option<Undo>, Vec<String>) {
+        let (summary, undo, errors, asked) = answered(job, &[]);
+        assert!(asked.is_empty(), "asked about {asked:?}");
+        (summary, undo, errors)
+    }
+
+    /// Run a job, giving these answers to its questions in turn. Also
+    /// returns the names it asked about.
+    fn answered(
+        job: Job,
+        answers: &[(Choice, bool)],
+    ) -> (String, Option<Undo>, Vec<String>, Vec<String>) {
         let (tx, rx) = std::sync::mpsc::channel();
         let fd = unsafe { libc::eventfd(0, libc::EFD_NONBLOCK) };
         let w = start(tx, fd);
         w.tx.send((job, Arc::new(AtomicBool::new(false)))).unwrap();
+        let mut asked = Vec::new();
         loop {
-            if let Msg::Done {
-                summary,
-                undo,
-                errors,
-                ..
-            } = rx.recv().unwrap()
-            {
-                unsafe { libc::close(fd) };
-                return (summary, undo, errors);
+            match rx.recv().unwrap() {
+                Msg::Ask { name, .. } => {
+                    let (choice, all) = answers[asked.len()];
+                    asked.push(name);
+                    w.answer.send(Answer { choice, all }).unwrap();
+                }
+                Msg::Done {
+                    summary,
+                    undo,
+                    errors,
+                    ..
+                } => {
+                    unsafe { libc::close(fd) };
+                    return (summary, undo, errors, asked);
+                }
+                Msg::Progress { .. } => {}
             }
         }
+    }
+
+    fn read(p: &Path) -> String {
+        fs::read_to_string(p).unwrap_or_else(|_| "<missing>".into())
     }
 
     #[test]
@@ -871,10 +1271,14 @@ mod tests {
         fs::set_permissions(d.join("src/sub/f"), fs::Permissions::from_mode(0o750)).unwrap();
         fs::create_dir(d.join("dst")).unwrap();
         fs::create_dir(d.join("dst/src")).unwrap();
-        let (_, undo, errors) = run(Job::Copy {
-            srcs: vec![d.join("src")],
-            dst: d.join("dst"),
-        });
+        let (_, undo, errors, asked) = answered(
+            Job::Copy {
+                srcs: vec![d.join("src")],
+                dst: d.join("dst"),
+            },
+            &[(Choice::KeepBoth, false)],
+        );
+        assert_eq!(asked, ["src"]);
         assert!(errors.is_empty(), "{errors:?}");
         assert_eq!(
             fs::read_to_string(d.join("dst/src (2)/sub/f")).unwrap(),
@@ -915,8 +1319,6 @@ mod tests {
     #[test]
     fn trash_writes_trashinfo_and_restore_puts_it_back() {
         let d = tmp("trash");
-        let data = d.join("data");
-        std::env::set_var("XDG_DATA_HOME", &data);
         fs::write(d.join("note 1.txt"), "x").unwrap();
         let (file, info, orig) = trash(&d.join("note 1.txt")).unwrap();
         assert!(!orig.exists() && file.exists());
@@ -970,6 +1372,168 @@ mod tests {
         assert!(msg.contains("already exists"));
         assert_eq!(fs::read_to_string(j("e")).unwrap(), "e");
         assert_eq!(fs::read_dir(&d).unwrap().count(), 4);
+        let _ = fs::remove_dir_all(&d);
+    }
+    #[test]
+    fn pasting_where_it_is_keeps_both_without_asking() {
+        let d = tmp("same");
+        fs::write(d.join("a.txt"), "a").unwrap();
+        let (_, _, errors) = run(Job::Copy {
+            srcs: vec![d.join("a.txt")],
+            dst: d.clone(),
+        });
+        assert!(errors.is_empty());
+        assert_eq!(read(&d.join("a (2).txt")), "a");
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn replace_trashes_the_old_one_and_undo_and_redo_swap_them() {
+        let d = tmp("replace");
+        fs::create_dir_all(d.join("src")).unwrap();
+        fs::create_dir_all(d.join("dst")).unwrap();
+        fs::write(d.join("src/a.txt"), "new").unwrap();
+        fs::write(d.join("dst/a.txt"), "old").unwrap();
+        let (summary, undo, errors, asked) = answered(
+            Job::Copy {
+                srcs: vec![d.join("src/a.txt")],
+                dst: d.join("dst"),
+            },
+            &[(Choice::Replace, false)],
+        );
+        assert!(errors.is_empty(), "{errors:?}");
+        assert_eq!(asked, ["a.txt"]);
+        assert!(summary.contains("1 replaced"), "{summary}");
+        assert_eq!(read(&d.join("dst/a.txt")), "new");
+        let names: Vec<_> = fs::read_dir(d.join("dst")).unwrap().flatten().collect();
+        assert_eq!(names.len(), 1, "no temporary files are left");
+        // Undo: the copy to the trash, the old one back.
+        let (_, redo, errors) = run(Job::Revert {
+            undo: undo.unwrap(),
+        });
+        assert!(errors.is_empty(), "{errors:?}");
+        assert_eq!(read(&d.join("dst/a.txt")), "old");
+        // Redo: the other way round again.
+        let (_, again, errors) = run(Job::Revert {
+            undo: redo.unwrap(),
+        });
+        assert!(errors.is_empty(), "{errors:?}");
+        assert_eq!(read(&d.join("dst/a.txt")), "new");
+        run(Job::Revert {
+            undo: again.unwrap(),
+        });
+        assert_eq!(read(&d.join("dst/a.txt")), "old");
+        assert_eq!(read(&d.join("src/a.txt")), "new");
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn a_failed_copy_never_costs_the_existing_file() {
+        let d = tmp("replace-fail");
+        fs::create_dir_all(d.join("src")).unwrap();
+        fs::create_dir_all(d.join("dst")).unwrap();
+        fs::write(d.join("src/a.txt"), "new").unwrap();
+        fs::write(d.join("dst/a.txt"), "old").unwrap();
+        fs::set_permissions(d.join("src/a.txt"), fs::Permissions::from_mode(0o000)).unwrap();
+        if fs::File::open(d.join("src/a.txt")).is_ok() {
+            // Run as root: the file stays readable, nothing to test.
+            let _ = fs::remove_dir_all(&d);
+            return;
+        }
+        let (_, _, errors, _) = answered(
+            Job::Copy {
+                srcs: vec![d.join("src/a.txt")],
+                dst: d.join("dst"),
+            },
+            &[(Choice::Replace, false)],
+        );
+        assert_eq!(errors.len(), 1);
+        assert_eq!(read(&d.join("dst/a.txt")), "old");
+        assert_eq!(fs::read_dir(d.join("dst")).unwrap().count(), 1);
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn skip_and_keep_both_apply_to_all() {
+        let d = tmp("all");
+        fs::create_dir_all(d.join("src")).unwrap();
+        fs::create_dir_all(d.join("dst")).unwrap();
+        for n in ["a", "b", "c"] {
+            fs::write(d.join("src").join(n), "new").unwrap();
+            fs::write(d.join("dst").join(n), "old").unwrap();
+        }
+        let srcs: Vec<PathBuf> = ["a", "b", "c"]
+            .iter()
+            .map(|n| d.join("src").join(n))
+            .collect();
+        let (summary, _, _, asked) = answered(
+            Job::Copy {
+                srcs: srcs.clone(),
+                dst: d.join("dst"),
+            },
+            &[(Choice::Skip, false), (Choice::KeepBoth, true)],
+        );
+        assert_eq!(asked.len(), 2, "the second answer was for all");
+        assert!(summary.contains("1 skipped"), "{summary}");
+        assert!(!d.join("dst/a (2)").exists());
+        assert_eq!(read(&d.join("dst/b (2)")), "new");
+        assert_eq!(read(&d.join("dst/c (2)")), "new");
+        assert_eq!(read(&d.join("dst/a")), "old");
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn merging_folders_asks_inside_and_undoes() {
+        let d = tmp("merge");
+        fs::create_dir_all(d.join("src/f/deep")).unwrap();
+        fs::create_dir_all(d.join("dst/f")).unwrap();
+        fs::write(d.join("src/f/x"), "x").unwrap();
+        fs::write(d.join("src/f/y"), "new y").unwrap();
+        fs::write(d.join("src/f/deep/z"), "z").unwrap();
+        fs::write(d.join("dst/f/y"), "old y").unwrap();
+        fs::write(d.join("dst/f/w"), "w").unwrap();
+        let (_, undo, errors, asked) = answered(
+            Job::Move {
+                srcs: vec![d.join("src/f")],
+                dst: d.join("dst"),
+            },
+            &[(Choice::Merge, false), (Choice::Replace, false)],
+        );
+        assert!(errors.is_empty(), "{errors:?}");
+        assert_eq!(asked, ["f", "y"]);
+        assert_eq!(read(&d.join("dst/f/x")), "x");
+        assert_eq!(read(&d.join("dst/f/y")), "new y");
+        assert_eq!(read(&d.join("dst/f/w")), "w");
+        assert_eq!(read(&d.join("dst/f/deep/z")), "z");
+        assert!(!d.join("src/f").exists(), "the emptied folder goes");
+        let (_, _, errors) = run(Job::Revert {
+            undo: undo.unwrap(),
+        });
+        assert!(errors.is_empty(), "{errors:?}");
+        assert_eq!(read(&d.join("src/f/x")), "x");
+        assert_eq!(read(&d.join("src/f/y")), "new y");
+        assert_eq!(read(&d.join("src/f/deep/z")), "z");
+        assert_eq!(read(&d.join("dst/f/y")), "old y");
+        assert_eq!(read(&d.join("dst/f/w")), "w");
+        assert!(!d.join("dst/f/x").exists());
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn replacing_a_folder_with_a_file_inside_it_is_refused() {
+        let d = tmp("inside");
+        fs::create_dir_all(d.join("p/d")).unwrap();
+        fs::write(d.join("p/d/d"), "file").unwrap();
+        let (_, _, errors, asked) = answered(
+            Job::Move {
+                srcs: vec![d.join("p/d/d")],
+                dst: d.join("p"),
+            },
+            &[(Choice::Replace, false)],
+        );
+        assert_eq!(asked, ["d"]);
+        assert_eq!(errors.len(), 1);
+        assert_eq!(read(&d.join("p/d/d")), "file");
         let _ = fs::remove_dir_all(&d);
     }
 }

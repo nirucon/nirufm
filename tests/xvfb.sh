@@ -202,6 +202,7 @@ echo "bookmark order ok"
 # Text fields: the path bar completes with Tab and edits like any field;
 # a click places the cursor; the search field takes Home and typing.
 mkdir -p "$SB/t/alpha/inner" "$SB/t/beta"
+echo new > "$SB/t/a.txt"; echo old > "$SB/t/beta/a.txt"
 NIRUFM_PLACES=1 "$BIN" "$SB/t" 2>"$SB/t.err" &
 T=$!
 PIDS="$PIDS $T"
@@ -230,4 +231,32 @@ sleep 0.5
 state | grep -q '^state 0 selected 0 ' && fail "search found nothing"
 k Escape
 echo "text fields ok"
+
+# A name that exists: asked, and Replace, Keep both, Skip (a click) and
+# Esc do what they say; the replaced file comes back with Ctrl+Z.
+asked() { grep -c "^ask a.txt " "$SB/t.err" || true; }
+k End ctrl+c ctrl+l
+xdotool type --delay 30 "$SB/t/beta"
+k Return
+n=$(asked)
+k ctrl+v
+[ "$(asked)" -gt "$n" ] || fail "no question for a name that exists"
+k r
+sleep 0.5
+[ "$(cat "$SB/t/beta/a.txt")" = new ] || fail "replace"
+ls "$XDG_DATA_HOME/Trash/files" | grep -q '^a.txt' || fail "the replaced file is not in the trash"
+k ctrl+z
+sleep 0.5
+[ "$(cat "$SB/t/beta/a.txt")" = old ] || fail "undo of a replace"
+k ctrl+v k
+sleep 0.5
+[ "$(cat "$SB/t/beta/a (2).txt")" = new ] || fail "keep both"
+k ctrl+v
+set -- $(grep '^answer Skip ' "$SB/t.err" | tail -1)
+xdotool mousemove "$3" "$4" click 1; sleep 0.5
+[ ! -e "$SB/t/beta/a (3).txt" ] && [ "$(cat "$SB/t/beta/a.txt")" = old ] || fail "skip"
+k ctrl+v Escape
+sleep 0.5
+[ "$(ls "$SB/t/beta" | wc -l)" = 2 ] || fail "Esc in the question: $(ls "$SB/t/beta")"
+echo "name conflicts ok"
 echo "PASS"
