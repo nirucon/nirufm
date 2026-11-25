@@ -1090,8 +1090,11 @@ pub fn rename_noreplace(from: &Path, to: &Path) -> std::io::Result<()> {
             .map_err(|_| std::io::Error::from(std::io::ErrorKind::InvalidInput))
     };
     let (f, t) = (c(from)?, c(to)?);
+    // The system call itself: the musl the release is linked with has no
+    // renameat2() wrapper, the kernel has had the call since 3.15.
     let r = unsafe {
-        libc::renameat2(
+        libc::syscall(
+            libc::SYS_renameat2,
             libc::AT_FDCWD,
             f.as_ptr(),
             libc::AT_FDCWD,
