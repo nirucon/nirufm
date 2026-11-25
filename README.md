@@ -81,7 +81,10 @@ Measured on the same machine in the same X server (Debian 13). A folder of
 - **Bookmarks** (the GTK list, shared with other programs): Ctrl+D or "Add to
   bookmarks" on folders; drag them in the side panel to put them in order;
   right-click to move up or down, rename, open in a new tab or remove.
-- **Open with** any program for the file type, recent files, send to a
+- **Open with** any program for the file type: the menu lists the first
+  six, and "Open with…" all of them, with "Always open … files with it" to
+  make the choice the default (written to `~/.config/mimeapps.list`, the
+  rest of that file kept). Also recent files, send to a
   NIRUSHARE device, a sound when a long copy ends, and the key sheet on F1.
 
 ## Using it

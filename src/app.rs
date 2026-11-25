@@ -105,6 +105,9 @@ enum Hit {
     Pane(usize),
     Eject(usize),
     MenuOutside,
+    /// A program in the Open with list, and its "always" box.
+    ChooserRow(usize),
+    ChooserAlways,
     /// A button of the dialog for a name that exists.
     Answer(crate::ops::Choice),
     AnswerAll,
@@ -206,6 +209,10 @@ pub struct App {
     side_total: i32,
     apps: Option<crate::apps::Apps>,
     menu_apps: Vec<crate::apps::App>,
+    /// The type the "Open with" entries of the open menu are for.
+    menu_mime: Option<String>,
+    /// The Open with list.
+    chooser: Option<Chooser>,
     /// The templates the open menu lists.
     menu_templates: Vec<PathBuf>,
     press: Option<(i32, i32)>,
@@ -377,6 +384,21 @@ enum Origin {
     Redo,
 }
 
+/// "Open with": every program for a type, one to open the files with and,
+/// with "always" ticked, to make the default for the type.
+struct Chooser {
+    mime: String,
+    files: Vec<PathBuf>,
+    apps: Vec<crate::apps::App>,
+    /// The program chosen in the list, and the first row shown.
+    pos: usize,
+    top: usize,
+    always: bool,
+    /// The current default, marked in the list.
+    default: Option<String>,
+    last_click: Option<(Instant, usize)>,
+}
+
 /// The question for a name that exists, from the worker.
 struct Ask {
     name: String,
@@ -430,6 +452,9 @@ enum Act {
     NcBrowser,
     Props,
     OpenWith(u8),
+    /// The list of all programs for the type, to open with one and make
+    /// it the default.
+    OpenWithOther,
     Wallpaper,
     SendTo(u8),
 }
@@ -574,6 +599,8 @@ impl App {
             apps: None,
             menu_apps: Vec::new(),
             menu_templates: Vec::new(),
+            menu_mime: None,
+            chooser: None,
             press: None,
             single_on_release: None,
             drag: None,
@@ -1146,6 +1173,27 @@ impl App {
                                     eprintln!("item {} {} {} {} {}", e.label, r.x, r.y, r.w, r.h);
                                 }
                             }
+                            Hit::MenuItem(i) => {
+                                if let Some(it) = self.menu.as_ref().and_then(|m| m.items.get(*i)) {
+                                    eprintln!(
+                                        "menuitem {} {} {}",
+                                        it.0,
+                                        r.x + r.w / 2,
+                                        r.y + r.h / 2
+                                    );
+                                }
+                            }
+                            Hit::ChooserRow(i) => {
+                                if let Some(a) = self.chooser.as_ref().and_then(|c| c.apps.get(*i))
+                                {
+                                    eprintln!(
+                                        "program {} {} {}",
+                                        a.id,
+                                        r.x + r.w / 2,
+                                        r.y + r.h / 2
+                                    );
+                                }
+                            }
                             Hit::Answer(c) => {
                                 eprintln!("answer {c:?} {} {}", r.x + r.w / 2, r.y + r.h / 2)
                             }
@@ -1425,6 +1473,9 @@ impl App {
             // The form is modal: only its fields take presses.
             return;
         }
+        if self.chooser.is_some() {
+            return self.chooser_button(b, x, y);
+        }
         if self.menu.is_some() {
             if let (1 | 3, Some(Hit::MenuItem(i))) = (b, self.hit(x, y)) {
                 let act = self
@@ -1652,6 +1703,9 @@ impl App {
         }
         if self.connect.is_some() {
             return self.connect_key(sym, ctrl, shift);
+        }
+        if self.chooser.is_some() {
+            return self.chooser_key(sym);
         }
         if self.batch.is_some() {
             return self.batch_key(sym, ctrl, shift);
@@ -2106,6 +2160,7 @@ impl App {
         self.draw_confirm();
         self.draw_connect();
         self.draw_batch();
+        self.draw_chooser();
         self.draw_ask();
     }
 
@@ -3399,6 +3454,11 @@ impl App {
                     self.flash(format!("Sending to {host}"));
                 }
             }
+            Act::OpenWithOther => {
+                if let Some(mime) = self.menu_mime.clone() {
+                    self.open_chooser(mime, sel);
+                }
+            }
             Act::OpenWith(k) => {
                 if let Some(app) = self.menu_apps.get(k as usize).cloned() {
                     crate::apps::launch(&app, &sel, &here);
@@ -4119,11 +4179,17 @@ impl App {
                 .map(|e| e.mime.clone())
                 .collect();
             self.menu_apps.clear();
+            self.menu_mime = None;
             if !mimes.is_empty() && mimes.iter().all(|m| m == &mimes[0]) {
                 let apps = self.apps.get_or_insert_with(crate::apps::Apps::load);
-                self.menu_apps = apps.for_mime(&mimes[0]).into_iter().take(6).collect();
+                let all = apps.for_mime(&mimes[0]);
+                self.menu_apps = all.iter().take(6).cloned().collect();
                 for (k, a) in self.menu_apps.iter().enumerate() {
                     items.push((format!("Open with {}", a.name), Act::OpenWith(k as u8), ""));
+                }
+                if !all.is_empty() {
+                    items.push(("Open with…".into(), Act::OpenWithOther, "set default"));
+                    self.menu_mime = Some(mimes[0].clone());
                 }
             }
             if sel.iter().any(|p| p.is_dir()) {
@@ -6538,6 +6604,236 @@ fn group_name(gid: u32) -> String {
 }
 
 impl App {
+    fn open_chooser(&mut self, mime: String, files: Vec<PathBuf>) {
+        let apps = self.apps.get_or_insert_with(crate::apps::Apps::load);
+        let list = apps.for_mime(&mime);
+        let default = apps.default_for(&mime).map(str::to_string);
+        self.chooser = Some(Chooser {
+            mime,
+            files,
+            apps: list,
+            pos: 0,
+            top: 0,
+            always: false,
+            default,
+            last_click: None,
+        });
+        self.dirty = true;
+    }
+
+    /// Rows the Open with list shows at once.
+    const CHOOSER_ROWS: usize = 10;
+
+    fn chooser_key(&mut self, sym: u32) {
+        let Some(c) = self.chooser.as_mut() else {
+            return;
+        };
+        self.dirty = true;
+        let n = c.apps.len();
+        match sym {
+            0xff1b => self.chooser = None,
+            0xff52 | 0xff97 => c.pos = c.pos.saturating_sub(1),
+            0xff54 | 0xff99 => c.pos = (c.pos + 1).min(n.saturating_sub(1)),
+            0xff55 => c.pos = c.pos.saturating_sub(Self::CHOOSER_ROWS),
+            0xff56 => c.pos = (c.pos + Self::CHOOSER_ROWS).min(n.saturating_sub(1)),
+            0xff50 => c.pos = 0,
+            0xff57 => c.pos = n.saturating_sub(1),
+            0x20 | 0x61 | 0x41 => c.always = !c.always, // Space, A
+            0xff0d | 0xff8d => self.chooser_open(),
+            _ => {}
+        }
+    }
+
+    fn chooser_button(&mut self, b: u8, x: i32, y: i32) {
+        let hit = self.hit(x, y);
+        let Some(c) = self.chooser.as_mut() else {
+            return;
+        };
+        self.dirty = true;
+        match (b, hit) {
+            (1, Some(Hit::ChooserRow(i))) => {
+                let double = c
+                    .last_click
+                    .is_some_and(|(t, j)| j == i && t.elapsed() < DOUBLE_CLICK);
+                c.pos = i;
+                c.last_click = Some((Instant::now(), i));
+                if double {
+                    self.chooser_open();
+                }
+            }
+            (1, Some(Hit::ChooserAlways)) => c.always = !c.always,
+            (4, _) => c.pos = c.pos.saturating_sub(1),
+            (5, _) => c.pos = (c.pos + 1).min(c.apps.len().saturating_sub(1)),
+            (1, Some(Hit::MenuOutside)) | (3, _) => self.chooser = None,
+            _ => {}
+        }
+    }
+
+    /// Enter in the Open with list: open the files, and with "always"
+    /// ticked make the program the default in ~/.config/mimeapps.list.
+    fn chooser_open(&mut self) {
+        let Some(c) = self.chooser.take() else {
+            return;
+        };
+        let Some(app) = c.apps.get(c.pos).cloned() else {
+            return;
+        };
+        let here = self.tab().path.clone();
+        crate::apps::launch(&app, &c.files, &here);
+        if !c.always {
+            self.flash(format!("Opening with {}", app.name));
+            return;
+        }
+        let file = theme::config_home().join("mimeapps.list");
+        match crate::apps::set_default(&file, &c.mime, &app.id) {
+            Ok(()) => {
+                // Read again, so the menu lists the new default first.
+                self.apps = None;
+                self.flash(format!("{} now opens {} files", app.name, c.mime));
+            }
+            Err(e) => self.flash_error(format!(
+                "Opened, but {} could not be made the default: {e}",
+                app.name
+            )),
+        }
+    }
+
+    fn draw_chooser(&mut self) {
+        let Some(mut c) = self.chooser.take() else {
+            return;
+        };
+        let p = self.p;
+        let (font, small, pad) = (self.m.font, self.m.small, self.m.pad);
+        let rows = Self::CHOOSER_ROWS.min(c.apps.len().max(1));
+        // The chosen row stays in sight.
+        let max_top = c.apps.len().saturating_sub(rows);
+        if c.pos < c.top {
+            c.top = c.pos;
+        } else if c.pos >= c.top + rows {
+            c.top = c.pos + 1 - rows;
+        }
+        c.top = c.top.min(max_top);
+        let row_h = font.height + pad / 2;
+        let w = (self.cv.w / 2)
+            .clamp((380.0 * self.m.s) as i32, (560.0 * self.m.s) as i32)
+            .min(self.cv.w - 2 * pad);
+        let h = 4 * pad
+            + font.height
+            + small.height
+            + pad
+            + rows as i32 * row_h
+            + pad
+            + 2 * (small.height + pad / 2)
+            + pad;
+        let r = Rect::new((self.cv.w - w) / 2, ((self.cv.h - h) / 3).max(0), w, h);
+        self.cv
+            .tint(Rect::new(0, 0, self.cv.w, self.cv.h), p.background, 140);
+        let sh = (4.0 * self.m.s) as i32;
+        self.cv
+            .tint(Rect::new(r.x + sh, r.y + sh, r.w, r.h), 0x000000, 120);
+        self.cv.fill(r, p.surface);
+        self.cv.frame(r, p.accent);
+        self.hits
+            .push((Rect::new(0, 0, self.cv.w, self.cv.h), Hit::MenuOutside));
+        self.hits.push((r, Hit::Content));
+        let mut y = r.y + 2 * pad;
+        crate::logo::word(
+            &mut self.cv,
+            r.x + 2 * pad,
+            y,
+            "OPEN WITH",
+            (2.0 * self.m.s).round().max(2.0) as i32,
+            p.accent,
+            None,
+        );
+        y += font.height + pad;
+        let what = match c.files.as_slice() {
+            [one] => one
+                .file_name()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .into_owned(),
+            many => format!("{} files", many.len()),
+        };
+        let line = self
+            .text
+            .ellipsize(&format!("{what} ({})", c.mime), small, r.w - 4 * pad);
+        self.text
+            .draw(&mut self.cv, r.x + 2 * pad, y, &line, small, p.muted);
+        y += small.height + pad;
+        for (i, a) in c.apps.iter().enumerate().skip(c.top).take(rows) {
+            let rr = Rect::new(r.x + pad, y, r.w - 2 * pad, row_h);
+            if i == c.pos {
+                self.cv.fill(rr, p.selected);
+                self.cv.fill(
+                    Rect::new(rr.x, rr.y, (2.0 * self.m.s).max(2.0) as i32, rr.h),
+                    p.accent,
+                );
+            }
+            let mark = if c.default.as_deref() == Some(a.id.as_str()) {
+                "default"
+            } else {
+                ""
+            };
+            let mw = self.text.width(mark, small);
+            let name = self.text.ellipsize(&a.name, font, rr.w - mw - 4 * pad);
+            self.text.draw(
+                &mut self.cv,
+                rr.x + pad,
+                rr.y + (row_h - font.height) / 2,
+                &name,
+                font,
+                p.foreground,
+            );
+            self.text.draw(
+                &mut self.cv,
+                rr.x + rr.w - mw - pad,
+                rr.y + (row_h - small.height) / 2,
+                mark,
+                small,
+                p.muted,
+            );
+            self.hits.push((rr, Hit::ChooserRow(i)));
+            y += row_h;
+        }
+        if c.apps.is_empty() {
+            self.text.draw(
+                &mut self.cv,
+                r.x + 2 * pad,
+                y,
+                "No program says it opens this type",
+                small,
+                p.muted,
+            );
+        }
+        y = r.y + 4 * pad + font.height + small.height + rows as i32 * row_h + pad;
+        let label = format!(
+            "{} Always open {} files with it",
+            if c.always { "[x]" } else { "[ ]" },
+            c.mime
+        );
+        let label = self.text.ellipsize(&label, small, r.w - 4 * pad);
+        let tw = self
+            .text
+            .draw(&mut self.cv, r.x + 2 * pad, y, &label, small, p.foreground);
+        self.hits.push((
+            Rect::new(r.x + 2 * pad, y, tw, small.height),
+            Hit::ChooserAlways,
+        ));
+        y += small.height + pad / 2;
+        self.text.draw(
+            &mut self.cv,
+            r.x + 2 * pad,
+            y,
+            "Enter open · Space always · Esc cancel",
+            small,
+            p.muted,
+        );
+        self.chooser = Some(c);
+    }
+}
+
+impl App {
     /// Keys of the dialog for a name that exists: the first letter of each
     /// choice, A for "apply to all", Enter keeps both, Esc stops the job.
     fn ask_key(&mut self, sym: u32) {
@@ -6837,6 +7133,7 @@ impl App {
                     ("Ctrl+Alt+N", "new empty file (templates: menu)"),
                     ("Alt+Enter", "properties"),
                     ("right-click", "menu: open with, pack, links"),
+                    ("Open with…, Space", "choose a program, always use it"),
                     ("drag on blank space", "select (Ctrl adds, Shift flips)"),
                     ("drag files", "move (Ctrl copies, Shift moves)"),
                     ("hold over a folder", "opens it while dragging"),

@@ -296,4 +296,25 @@ k ctrl+alt+n Escape ctrl+y
 sleep 0.5
 [ -f "$SB/t/beta/Letter.txt" ] && [ ! -e "$SB/t/beta/Memo.txt" ] || fail "redo after a new action"
 echo "redo ok"
+
+# Open with: the list of programs; one opens the file and, with "always"
+# ticked, becomes the default in mimeapps.list (the rest of it kept).
+mkdir -p "$XDG_DATA_HOME/applications"
+printf "[Desktop Entry]\nType=Application\nName=Zz Test Editor\nExec=cp %%f $SB/opened\nMimeType=text/plain;\n" > "$XDG_DATA_HOME/applications/zz-test.desktop"
+printf '# keep me\n[Added Associations]\nimage/png=x.desktop;\n' > "$XDG_CONFIG_HOME/mimeapps.list"
+echo x > "$SB/t/beta/zz.txt"
+sleep 0.5
+k End Menu
+set -- $(grep '^menuitem Open with… ' "$SB/t.err" | tail -1)
+[ -n "${4:-}" ] || fail "no Open with… in the menu"
+xdotool mousemove "$4" "$5" click 1; sleep 0.5
+set -- $(grep '^program zz-test.desktop ' "$SB/t.err" | tail -1)
+[ -n "${3:-}" ] || fail "the program is not in the list"
+xdotool mousemove "$3" "$4" click 1; sleep 0.3
+k space Return
+sleep 0.5
+[ "$(cat "$SB/opened" 2>/dev/null)" = x ] || fail "Open with did not open"
+grep -q '^text/plain=zz-test.desktop;$' "$XDG_CONFIG_HOME/mimeapps.list" || fail "no default: $(cat "$XDG_CONFIG_HOME/mimeapps.list")"
+grep -q '^# keep me$' "$XDG_CONFIG_HOME/mimeapps.list" && grep -q '^image/png=x.desktop;$' "$XDG_CONFIG_HOME/mimeapps.list" || fail "mimeapps.list lost lines"
+echo "open with ok"
 echo "PASS"

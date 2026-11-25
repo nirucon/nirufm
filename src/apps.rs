@@ -16,6 +16,9 @@ pub struct App {
 pub struct Apps {
     by_mime: HashMap<String, Vec<App>>,
     defaults: HashMap<String, Vec<String>>,
+    /// The program set to open each type ([Default Applications]; the
+    /// user's file comes first and wins).
+    chosen: HashMap<String, String>,
 }
 
 fn localized<'a>(text: &'a str, key: &str) -> Option<&'a str> {
@@ -76,6 +79,7 @@ impl Apps {
             }
         }
         let mut defaults: HashMap<String, Vec<String>> = HashMap::new();
+        let mut chosen: HashMap<String, String> = HashMap::new();
         let mut files = vec![crate::theme::config_home().join("mimeapps.list")];
         files.extend(
             crate::mime::data_dirs()
@@ -97,6 +101,13 @@ impl Apps {
                     continue;
                 }
                 if let Some((mime, ids)) = l.split_once('=') {
+                    if section == "[Default Applications]" {
+                        if let Some(id) = ids.split(';').find(|s| !s.is_empty()) {
+                            chosen
+                                .entry(mime.to_string())
+                                .or_insert_with(|| id.to_string());
+                        }
+                    }
                     let list = defaults.entry(mime.to_string()).or_default();
                     for id in ids.split(';').filter(|s| !s.is_empty()) {
                         if !list.iter().any(|x| x == id) {
@@ -106,7 +117,16 @@ impl Apps {
                 }
             }
         }
-        Apps { by_mime, defaults }
+        Apps {
+            by_mime,
+            defaults,
+            chosen,
+        }
+    }
+
+    /// The id of the program that opens `mime` by default, if one is set.
+    pub fn default_for(&self, mime: &str) -> Option<&str> {
+        self.chosen.get(mime).map(String::as_str)
     }
 
     /// Applications for a type: defaults first, then the rest by name.
@@ -203,6 +223,84 @@ pub fn command(exec: &str, files: &[PathBuf]) -> Vec<String> {
     out
 }
 
+/// Make `id` the program that opens `mime`: its line in the
+/// [Default Applications] part of `file` (mimeapps.list) is set, the rest
+/// of the file stays as it was. The new file is written beside the old one
+/// and renamed over it, so a crash never leaves half a file; a symbolic
+/// link (a dotfiles setup) keeps pointing at the file it points at.
+pub fn set_default(file: &Path, mime: &str, id: &str) -> std::io::Result<()> {
+    use std::io::Write;
+    let file = std::fs::canonicalize(file).unwrap_or_else(|_| file.to_path_buf());
+    let old = match std::fs::read_to_string(&file) {
+        Ok(t) => t,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(e) => return Err(e),
+    };
+    let new = with_default(&old, mime, id);
+    if let Some(dir) = file.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    let tmp = file.with_file_name(format!(".mimeapps.list.nirufm-{}", std::process::id()));
+    let result = (|| {
+        let mut f = std::fs::File::create(&tmp)?;
+        f.write_all(new.as_bytes())?;
+        f.sync_all()?;
+        if let Ok(m) = std::fs::metadata(&file) {
+            std::fs::set_permissions(&tmp, m.permissions())?;
+        }
+        std::fs::rename(&tmp, &file)
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    result
+}
+
+/// `text` (a mimeapps.list) with `id` first for `mime` in [Default
+/// Applications]: put in front on the line for `mime` (the others stay as
+/// fallbacks), else a line added at the end of that part, else the part
+/// added at the end.
+fn with_default(text: &str, mime: &str, id: &str) -> String {
+    let line = format!("{mime}={id};");
+    let mut lines: Vec<String> = text.lines().map(str::to_string).collect();
+    let start = lines
+        .iter()
+        .position(|l| l.trim() == "[Default Applications]");
+    let Some(start) = start else {
+        while lines.last().is_some_and(|l| l.trim().is_empty()) {
+            lines.pop();
+        }
+        if !lines.is_empty() {
+            lines.push(String::new());
+        }
+        lines.push("[Default Applications]".into());
+        lines.push(line);
+        return lines.join("\n") + "\n";
+    };
+    let end = lines[start + 1..]
+        .iter()
+        .position(|l| l.trim_start().starts_with('['))
+        .map_or(lines.len(), |k| start + 1 + k);
+    let key = |l: &str| l.split_once('=').map(|(k, _)| k.trim().to_string());
+    if let Some(k) = (start + 1..end).find(|&k| key(&lines[k]).as_deref() == Some(mime)) {
+        let (_, ids) = lines[k].split_once('=').unwrap_or_default();
+        let others: Vec<&str> = ids
+            .split(';')
+            .map(str::trim)
+            .filter(|x| !x.is_empty() && *x != id)
+            .collect();
+        lines[k] = others.iter().fold(line, |acc, x| format!("{acc}{x};"));
+    } else {
+        // After the part's last line, before blank lines that part it off.
+        let mut at = end;
+        while at > start + 1 && lines[at - 1].trim().is_empty() {
+            at -= 1;
+        }
+        lines.insert(at, line);
+    }
+    lines.join("\n") + "\n"
+}
+
 pub fn launch(app: &App, files: &[PathBuf], cwd: &Path) {
     let mut cmd = command(&app.exec, files);
     if app.terminal {
@@ -240,5 +338,67 @@ mod tests {
         );
         assert_eq!(command("player", &f), ["player", "/tmp/a b.png"]);
         assert_eq!(command("app %i %f", &f), ["app", "/tmp/a b.png"]);
+    }
+
+    #[test]
+    fn a_default_is_set_and_the_rest_kept() {
+        let text = "# mine\n[Added Associations]\ntext/plain=a.desktop;\n\n[Default Applications]\nimage/png=old.desktop;\ntext/plain=b.desktop;\n\n[Removed Associations]\nx/y=z.desktop;\n";
+        let out = with_default(text, "text/plain", "c.desktop");
+        assert_eq!(
+            out,
+            text.replace("text/plain=b.desktop;", "text/plain=c.desktop;b.desktop;")
+        );
+        let again = with_default(&out, "text/plain", "b.desktop");
+        assert_eq!(
+            again,
+            text.replace("text/plain=b.desktop;", "text/plain=b.desktop;c.desktop;")
+        );
+        let out = with_default(text, "video/mp4", "mpv.desktop");
+        assert_eq!(
+            out,
+            text.replace(
+                "text/plain=b.desktop;\n\n",
+                "text/plain=b.desktop;\nvideo/mp4=mpv.desktop;\n\n"
+            )
+        );
+        assert_eq!(
+            with_default("", "a/b", "x.desktop"),
+            "[Default Applications]\na/b=x.desktop;\n"
+        );
+        assert_eq!(
+            with_default("[Added Associations]\na/b=y.desktop;\n", "a/b", "x.desktop"),
+            "[Added Associations]\na/b=y.desktop;\n\n[Default Applications]\na/b=x.desktop;\n"
+        );
+        // The last part of the file.
+        assert_eq!(
+            with_default("[Default Applications]\nc/d=e;\n", "a/b", "x.desktop"),
+            "[Default Applications]\nc/d=e;\na/b=x.desktop;\n"
+        );
+    }
+
+    #[test]
+    fn mimeapps_is_written_whole_and_through_a_link() {
+        let d = std::env::temp_dir().join(format!("nirufm-mimeapps-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(d.join("dotfiles")).unwrap();
+        std::fs::write(d.join("dotfiles/mimeapps.list"), "[Default Applications]\n").unwrap();
+        std::os::unix::fs::symlink(d.join("dotfiles/mimeapps.list"), d.join("mimeapps.list"))
+            .unwrap();
+        set_default(&d.join("mimeapps.list"), "text/plain", "ed.desktop").unwrap();
+        assert!(std::fs::symlink_metadata(d.join("mimeapps.list"))
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        assert_eq!(
+            std::fs::read_to_string(d.join("dotfiles/mimeapps.list")).unwrap(),
+            "[Default Applications]\ntext/plain=ed.desktop;\n"
+        );
+        set_default(&d.join("new/mimeapps.list"), "a/b", "x.desktop").unwrap();
+        assert_eq!(
+            std::fs::read_dir(&d).unwrap().count(),
+            3,
+            "no temporary files"
+        );
+        let _ = std::fs::remove_dir_all(&d);
     }
 }
