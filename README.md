@@ -71,6 +71,10 @@ Measured on the same machine in the same X server (Debian 13). A folder of
   folder scrolls on when the band reaches its edge.
 - **Tabs and two panes** (F3), **search** below a folder (Ctrl+F), a
   **properties** sheet with folder totals and SHA-256 (Alt+Enter).
+- **Permissions** in the properties sheet: boxes for who may read, write
+  and run (for a folder: open) the item, applied at once, and X to make a
+  file executable in one go. When a change is not possible it says why in
+  plain words.
 - **Pack and unpack** zip, tar.gz, 7z and more.
 - **Drives:** USB sticks and SD cards mount with a click and eject with ⏏
   (udisks2).

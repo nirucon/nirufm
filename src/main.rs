@@ -13,6 +13,7 @@ mod logo;
 mod mime;
 mod nextcloud;
 mod ops;
+mod perms;
 mod places;
 mod remote;
 mod templates;

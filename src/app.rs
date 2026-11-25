@@ -108,6 +108,8 @@ enum Hit {
     /// A program in the Open with list, and its "always" box.
     ChooserRow(usize),
     ChooserAlways,
+    /// A permission box of the properties sheet.
+    Perm(usize),
     /// A button of the dialog for a name that exists.
     Answer(crate::ops::Choice),
     AnswerAll,
@@ -374,6 +376,11 @@ struct Props {
     /// bytes, files, folders, done
     totals: std::sync::Arc<std::sync::Mutex<(u64, u64, u64, bool)>>,
     sha: std::sync::Arc<std::sync::Mutex<Option<String>>>,
+    /// The permission box with the keyboard focus: 0..9 the grid (owner,
+    /// group, others by read, write, run), 9 "executable".
+    focus: usize,
+    /// What the last change of permissions did, and whether it failed.
+    note: Option<(String, bool)>,
 }
 
 /// Why a job was sent, which decides where its undo step goes.
@@ -1194,6 +1201,9 @@ impl App {
                                     );
                                 }
                             }
+                            Hit::Perm(k) => {
+                                eprintln!("perm {k} {} {}", r.x + r.w / 2, r.y + r.h / 2)
+                            }
                             Hit::Answer(c) => {
                                 eprintln!("answer {c:?} {} {}", r.x + r.w / 2, r.y + r.h / 2)
                             }
@@ -1209,6 +1219,9 @@ impl App {
                                 r.x, r.y, r.w, r.h, ed.cursor, ed.anchor, ed.text
                             );
                         }
+                    }
+                    if let Some((note, _)) = self.props.as_ref().and_then(|p| p.note.as_ref()) {
+                        eprintln!("propsnote {note}");
                     }
                     if let Some(a) = &self.ask {
                         eprintln!("ask {} all {}", a.name, a.all);
@@ -1476,6 +1489,15 @@ impl App {
         if self.chooser.is_some() {
             return self.chooser_button(b, x, y);
         }
+        if self.props.is_some() {
+            match (b, self.hit(x, y)) {
+                (1, Some(Hit::Perm(k))) => self.props_toggle(k),
+                (_, Some(Hit::MenuOutside)) => self.props = None,
+                _ => {}
+            }
+            self.dirty = true;
+            return;
+        }
         if self.menu.is_some() {
             if let (1 | 3, Some(Hit::MenuItem(i))) = (b, self.hit(x, y)) {
                 let act = self
@@ -1694,12 +1716,7 @@ impl App {
             return;
         }
         if self.props.is_some() {
-            match sym {
-                0x73 => self.props_checksum(), // s
-                _ => self.props = None,
-            }
-            self.dirty = true;
-            return;
+            return self.props_key(sym, shift);
         }
         if self.connect.is_some() {
             return self.connect_key(sym, ctrl, shift);
@@ -6374,8 +6391,79 @@ impl App {
             paths,
             totals,
             sha: std::sync::Arc::new(std::sync::Mutex::new(None)),
+            focus: 0,
+            note: None,
         });
         self.dirty = true;
+    }
+
+    /// The one item the sheet is about and its permission bits, when the
+    /// sheet can change them (a single item that is there).
+    fn props_mode(&self) -> Option<(PathBuf, u32, bool)> {
+        use std::os::unix::fs::MetadataExt;
+        let pr = self.props.as_ref()?;
+        let [path] = pr.paths.as_slice() else {
+            return None;
+        };
+        let m = std::fs::metadata(path).ok()?;
+        Some((path.clone(), m.mode() & 0o7777, m.is_dir()))
+    }
+
+    /// Flip permission box `k` (see `Props::focus`) and apply it at once.
+    fn props_toggle(&mut self, k: usize) {
+        let Some((path, mode, is_dir)) = self.props_mode() else {
+            return;
+        };
+        let new = match k {
+            0..=8 => mode ^ crate::perms::bit(k / 3, k % 3),
+            9 if !is_dir => crate::perms::executable(mode, mode & 0o100 == 0),
+            _ => return,
+        };
+        let note = match crate::perms::apply(&path, new) {
+            Ok(m) => (
+                format!("Permissions now {} ({m:o})", perm_string(m, is_dir)),
+                false,
+            ),
+            Err(e) => (e, true),
+        };
+        if let Some(pr) = self.props.as_mut() {
+            pr.focus = k;
+            pr.note = Some(note);
+        }
+        self.dirty = true;
+    }
+
+    /// Keys of the properties sheet: arrows and Tab move between the
+    /// permission boxes, Space flips one, X makes a file executable or not,
+    /// S computes the checksum; Esc, Enter or Q close it.
+    fn props_key(&mut self, sym: u32, shift: bool) {
+        self.dirty = true;
+        let boxes: usize = match self.props_mode() {
+            Some((_, _, false)) => 10,
+            Some((_, _, true)) => 9,
+            None => 0,
+        };
+        let Some(pr) = self.props.as_mut() else {
+            return;
+        };
+        let f = pr.focus.min(boxes.saturating_sub(1));
+        pr.focus = match sym {
+            0xff51 if f % 3 > 0 && f < 9 => f - 1,
+            0xff53 if f % 3 < 2 && f < 9 => f + 1,
+            0xff52 if f >= 3 => f - 3,
+            0xff54 if f + 3 < boxes => f + 3,
+            0xff54 if f >= 6 && boxes == 10 => 9,
+            0xff09 if boxes > 0 && !shift => (f + 1) % boxes,
+            0xfe20 | 0xff09 if boxes > 0 => (f + boxes - 1) % boxes,
+            _ => f,
+        };
+        match sym {
+            0x20 if boxes > 0 => self.props_toggle(f),
+            0x78 | 0x58 if boxes == 10 => self.props_toggle(9),
+            0x73 | 0x53 => self.props_checksum(),
+            0xff1b | 0xff0d | 0xff8d | 0x71 | 0x51 => self.props = None,
+            _ => {}
+        }
     }
 
     fn props_checksum(&mut self) {
@@ -6511,8 +6599,26 @@ impl App {
             .max((360.0 * self.m.s) as i32)
             .min(self.cv.w - 4 * pad);
         let row_h = small.height + pad / 2;
-        let h = 4 * pad + font.height + rows.len() as i32 * row_h + small.height + 2 * pad;
-        let r = Rect::new((self.cv.w - w) / 2, (self.cv.h - h) / 3, w, h);
+        let perms = self.props_mode();
+        // The permission boxes: a heading, three rows, "executable" for a
+        // file, and a line for what the last change did.
+        let perm_rows = match &perms {
+            Some((_, _, true)) => 5,
+            Some(_) => 6,
+            None => 0,
+        };
+        let h = 4 * pad
+            + font.height
+            + (rows.len() + perm_rows) as i32 * row_h
+            + if perm_rows > 0 { pad } else { 0 }
+            + small.height
+            + 2 * pad;
+        let r = Rect::new(
+            (self.cv.w - w) / 2,
+            ((self.cv.h - h) / 3).max(0),
+            w,
+            h.min(self.cv.h),
+        );
         self.cv
             .tint(Rect::new(0, 0, self.cv.w, self.cv.h), p.background, 140);
         let sh = (4.0 * self.m.s) as i32;
@@ -6520,6 +6626,9 @@ impl App {
             .tint(Rect::new(r.x + sh, r.y + sh, r.w, r.h), 0x000000, 120);
         self.cv.fill(r, p.surface);
         self.cv.frame(r, p.accent);
+        self.hits
+            .push((Rect::new(0, 0, self.cv.w, self.cv.h), Hit::MenuOutside));
+        self.hits.push((r, Hit::Content));
         let t = self.text.ellipsize(&title, font, w - 4 * pad);
         self.text.draw(
             &mut self.cv,
@@ -6544,14 +6653,110 @@ impl App {
             );
             y += row_h;
         }
+        if let Some((_, mode, is_dir)) = perms {
+            y = self.draw_perm_boxes(r, label_w, y + pad / 2, mode, is_dir);
+        }
+        let keys = if perm_rows > 0 {
+            "Space flip · arrows move · S checksum · Esc close"
+        } else {
+            "S checksum · Esc close"
+        };
         self.text.draw(
             &mut self.cv,
             r.x + 2 * pad,
             y + pad / 2,
-            "S checksum · any key closes",
+            keys,
             small,
             p.muted,
         );
+    }
+
+    /// Who may read, write and run (open, for a folder) the item: boxes
+    /// to click, in rows from `y`. Returns the y below them.
+    fn draw_perm_boxes(
+        &mut self,
+        r: Rect,
+        label_w: i32,
+        mut y: i32,
+        mode: u32,
+        is_dir: bool,
+    ) -> i32 {
+        let p = self.p;
+        let (small, pad) = (self.m.small, self.m.pad);
+        let row_h = small.height + pad / 2;
+        let (focus, note) = match self.props.as_ref() {
+            Some(pr) => (pr.focus, pr.note.clone()),
+            None => (0, None),
+        };
+        let x0 = r.x + 2 * pad + label_w;
+        let col = self
+            .text
+            .width("Write  ", small)
+            .max(self.text.width("Open  ", small))
+            + pad;
+        let heads = ["Read", "Write", if is_dir { "Open" } else { "Run" }];
+        for (k, hd) in heads.iter().enumerate() {
+            self.text
+                .draw(&mut self.cv, x0 + k as i32 * col, y, hd, small, p.muted);
+        }
+        y += row_h;
+        let side = (small.height - 2).max(6);
+        let boxed =
+            |cv: &mut Canvas, hits: &mut Vec<(Rect, Hit)>, x: i32, y: i32, on: bool, k: usize| {
+                let b = Rect::new(x, y + (small.height - side) / 2, side, side);
+                cv.fill(b, p.background);
+                cv.frame(b, if focus == k { p.accent } else { p.border });
+                if on {
+                    cv.fill(b.inset((side / 4).max(2)), p.accent);
+                }
+                hits.push((b.inset(-pad / 3), Hit::Perm(k)));
+            };
+        for (who, label) in ["Owner", "Group", "Others"].iter().enumerate() {
+            self.text
+                .draw(&mut self.cv, r.x + 2 * pad, y, label, small, p.muted);
+            for what in 0..3 {
+                let on = mode & crate::perms::bit(who, what) != 0;
+                boxed(
+                    &mut self.cv,
+                    &mut self.hits,
+                    x0 + what as i32 * col,
+                    y,
+                    on,
+                    who * 3 + what,
+                );
+            }
+            y += row_h;
+        }
+        if !is_dir {
+            boxed(&mut self.cv, &mut self.hits, x0, y, mode & 0o100 != 0, 9);
+            self.text.draw(
+                &mut self.cv,
+                x0 + side + pad,
+                y,
+                "Executable: X (run as a program)",
+                small,
+                p.foreground,
+            );
+            y += row_h;
+        }
+        let (text, err) = match note {
+            Some((t, e)) => (t, e),
+            None if is_dir => (
+                "For a folder, Open means going into it and reaching what is inside".into(),
+                false,
+            ),
+            None => (String::new(), false),
+        };
+        let text = self.text.ellipsize(&text, small, r.w - 4 * pad);
+        self.text.draw(
+            &mut self.cv,
+            r.x + 2 * pad,
+            y,
+            &text,
+            small,
+            if err { p.error } else { p.muted },
+        );
+        y + row_h
     }
 }
 
@@ -7131,7 +7336,8 @@ impl App {
                     ("F2", "rename (several: find, replace, {n})"),
                     ("Ctrl+Shift+N", "new folder"),
                     ("Ctrl+Alt+N", "new empty file (templates: menu)"),
-                    ("Alt+Enter", "properties"),
+                    ("Alt+Enter", "properties, permissions"),
+                    ("Space, X (properties)", "flip a permission, executable"),
                     ("right-click", "menu: open with, pack, links"),
                     ("Open with…, Space", "choose a program, always use it"),
                     ("drag on blank space", "select (Ctrl adds, Shift flips)"),

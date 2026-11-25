@@ -317,4 +317,26 @@ sleep 0.5
 grep -q '^text/plain=zz-test.desktop;$' "$XDG_CONFIG_HOME/mimeapps.list" || fail "no default: $(cat "$XDG_CONFIG_HOME/mimeapps.list")"
 grep -q '^# keep me$' "$XDG_CONFIG_HOME/mimeapps.list" && grep -q '^image/png=x.desktop;$' "$XDG_CONFIG_HOME/mimeapps.list" || fail "mimeapps.list lost lines"
 echo "open with ok"
+
+# Permissions in Properties: X makes a file executable, a click flips one
+# box; a file of another owner says why it cannot change.
+echo 'echo hi' > "$SB/t/beta/run.sh"; chmod 644 "$SB/t/beta/run.sh"
+sleep 0.5
+xdotool type --delay 40 "run"
+k alt+Return x
+[ "$(stat -c %a "$SB/t/beta/run.sh")" = 755 ] || fail "executable: $(stat -c %a "$SB/t/beta/run.sh")"
+set -- $(grep '^perm 8 ' "$SB/t.err" | tail -1)
+xdotool mousemove "$3" "$4" click 1; sleep 0.4
+[ "$(stat -c %a "$SB/t/beta/run.sh")" = 754 ] || fail "a click on others run: $(stat -c %a "$SB/t/beta/run.sh")"
+k Escape
+if [ "$(id -u)" != 0 ] && [ "$(stat -c %u /etc/hostname 2>/dev/null)" = 0 ]; then
+  k ctrl+l ctrl+a
+  xdotool type --delay 30 "/etc"
+  k Return
+  xdotool type --delay 40 "hostname"
+  k alt+Return space
+  grep '^propsnote ' "$SB/t.err" | tail -1 | grep -q 'Only the owner' || fail "no plain error: $(grep '^propsnote' "$SB/t.err" | tail -1)"
+  k Escape
+fi
+echo "permissions ok"
 echo "PASS"
